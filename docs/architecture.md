@@ -1,6 +1,7 @@
 # CAML Networking Engine: Architecture
 
-Last updated: Stage 0–2 (first milestone).
+Last updated: Stage 0–2 (first milestone), plus the planned DPDK backend
+design (section 9).
 
 ## 1. Scope and system boundary
 
@@ -43,7 +44,8 @@ pay for themselves are:
 Linux-specific transports will be modules in `engine` behind
 `#[cfg(target_os = "linux")]`. AF_XDP, which needs `libbpf`/`libxdp` and
 `unsafe`, will be its own feature-gated crate so the `unsafe_code = "forbid"`
-lint stays in force everywhere else.
+lint stays in force everywhere else. The same goes for the planned DPDK
+backend (section 9).
 
 ## 3. Key interfaces
 
@@ -69,9 +71,14 @@ forcing a copy:
 | `UdpSource` (now) | `recv_from` into an owned 64 KiB buffer, lend `&buf[..n]` |
 | `recvmmsg` (Phase B) | one syscall fills N buffers, lend each in turn |
 | AF_XDP (Phase C) | lend a UMEM frame slice, return the frame to the fill ring after the callback |
+| DPDK (planned, section 9) | lend each mbuf's UDP payload in wire order, bulk-free the burst after the last callback |
 
 Generic (`F: FnMut`) rather than `&mut dyn FnMut` so the per-packet call is
 monomorphized and inlined into the receive loop.
+
+`RxMeta` is `#[non_exhaustive]` and built with `RxMeta::now()`, so fields
+such as a NIC hardware timestamp can be added later without breaking
+backends in other crates. Batched backends capture one `RxMeta` per batch.
 
 ## 4. Concurrency model
 
@@ -172,7 +179,65 @@ is likely sufficient. We will measure before concluding. Real kernel-bypass
 evaluation needs a NIC with native XDP/zero-copy support (e.g. Intel i40e/ice,
 Mellanox mlx5).
 
-## 9. Testing strategy
+## 9. Kernel-bypass backends (planned)
+
+Status: **planned, not implemented.** No DPDK code or dependencies exist in
+the workspace. The source for this section is the
+[rust-dpdk-net review](research/rust-dpdk-net-review.md) (commit `8670af4`).
+
+**Decision on `rust-dpdk-net`: learn from it, don't depend on it.** It is a
+TCP/IP-over-DPDK framework (smoltcp plus tokio). Its UDP path copies each
+payload twice, adds async wake-ups, verifies checksums in software, has no
+receive timestamps, never reads NIC drop counters, hands each RX burst over
+newest-first (a spurious reorder for a sequenced feed), and lets a mempool be
+freed while its mbufs are still in use.
+
+| Reuse (pattern only) | Implement ourselves | Unnecessary for CAML |
+|---|---|---|
+| `build.rs`: pkg-config → bindgen allowlist → `cc`-compiled C shim that re-exports DPDK's `static inline` functions (`rte_eth_rx_burst`, `rte_pktmbuf_*`). MIT, so keep the notice if we copy a file substantially | `caml-transport-dpdk` crate: EAL/port/mempool lifecycle owned by one `DpdkSource` with ordered teardown | smoltcp or any TCP/IP stack |
+| Shape of its `EalBuilder`, `EthDevBuilder`, and `Mbuf` RAII wrappers, as reference | Own Ethernet/802.1Q/IPv4/UDP parser (~150 lines), differentially tested against `etherparse` 0.21.0 with `proptest` 1.11.0 | tokio, async reactor, cross-thread bridge |
+| | Per-reason drop counters, plus NIC `imissed` / `rx_nombuf` / `ierrors` read about once per second | Multi-queue RSS/RETA, shared ARP cache |
+| | pcap replay fixtures (`pcap-file` 2.0.0) for `net_pcap` tests | HTTP/gRPC/QUIC adapters |
+
+**Design summary:**
+
+* **Isolation:** a Linux-only crate behind an off-by-default `ffi` feature
+  (build deps `bindgen` 0.73.2, `pkg-config` 0.3.34, `cc` 1.7.0). Without the
+  feature it compiles to nothing, so `cargo test --workspace` keeps working
+  on Windows. It has its own lint table (`unsafe_code = "deny"`, allowed only
+  in the FFI modules, with a `// SAFETY:` comment on every block).
+  `caml-engine` never depends on DPDK.
+* **Hot loop:** one pinned EAL lcore. `poll()` busy-polls `rte_eth_rx_burst`
+  with a burst of 32 and processes packets **front to back, in wire order**.
+  It takes one `RxMeta` per burst, lends each UDP payload to the existing
+  callback, and frees the whole burst with one `rte_pktmbuf_free_bulk` from a
+  guard's `Drop`, so a panicking callback can't leak mbufs. It returns
+  `Ok(0)` after a short poll budget so the existing `run` loop's shutdown and
+  report checks still fire.
+* **Fits today's trait:** the `PacketSource` lending callback needs no change.
+  The higher-ranked `FnMut(&[u8], RxMeta)` bound already stops payload slices
+  from outliving the burst.
+* **Planned interface change, deferred:** a transport-level statistics
+  accessor (filter drops by reason, kernel or NIC drops). It will be added
+  together with the first backend that can actually observe such drops,
+  Linux `recvmmsg` with `SO_RXQ_OVFL`, rather than designed now against a
+  single implementation that has nothing to report. The current Windows UDP
+  backend cannot read kernel drop counts.
+* **Testing without hardware:** in a Linux VM, use the `net_pcap` (replaying
+  `caml-sim` captures), `net_ring`, `net_tap`, `net_af_packet`, and `net_null`
+  virtual devices. These validate **correctness only**; none of them shows
+  kernel-bypass performance.
+
+**Hardware: correcting a common assumption.** DPDK v25.11's e1000 (`em`) PMD
+**does** list I219-LM/V device IDs (`em_ethdev.c:112-190`). However, DPDK
+documents validation only on emulated e1000 devices; the PMD offers at most 2
+queues and no RSS or timestamp offload; and the link is 1 GbE. Binding
+`camlcompute`'s only port to `vfio-pci` would most likely remove it, and SSH
+with it, from Linux. **Conclusion: don't pursue DPDK for performance until a
+supported NIC (Intel X710/E810, NVIDIA ConnectX) is available,** and only
+after the kernel-socket baseline shows the kernel path is the bottleneck.
+
+## 10. Testing strategy
 
 * **Protocol:** a golden byte fixture pins the layout, plus every rejection
   path and 50,000 deterministic random/corrupted inputs to prove the decoder
@@ -186,7 +251,7 @@ Mellanox mlx5).
 * Everything is seeded and single-threaded where possible, so failures are
   reproducible.
 
-## 10. Main risks
+## 11. Main risks
 
 1. **Measurement validity on Windows.** Scheduler and timer behavior add
    jitter that is not present on a tuned Linux host. Mitigation: repeated
@@ -200,4 +265,7 @@ Mellanox mlx5).
 4. **Single-threaded consumer coupling.** A slow sink stalls the receive
    path. Mitigation: measure, then introduce an SPSC queue.
 5. **Hardware ceiling on `camlcompute`.** The I219-LM/e1000e has no native
-   XDP, which limits what kernel bypass can show there.
+   XDP. DPDK's `em` PMD probe-lists the I219, but it is unvalidated there,
+   limited to 2 queues with no RSS or timestamp offload, and would take the
+   server's only port away from Linux. Either way, kernel bypass can show
+   little on this machine (section 9).

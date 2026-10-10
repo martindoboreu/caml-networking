@@ -163,3 +163,109 @@ latency. The current bottleneck is the OS path, not our parsing.
 3. `LatencyHistogram::percentile` returns a bucket's upper bound. For a true
    value of 1,000,000 ns, what is the largest value it can report? Why is
    over-reporting preferable to under-reporting for latency?
+
+---
+
+## Research note: what to take from the `rust-dpdk-net` review
+
+The full analysis is in
+[`research/rust-dpdk-net-review.md`](research/rust-dpdk-net-review.md); its
+section 8 covers hugepages, DMA rings, RSS, and core isolation. This entry
+picks out the four ideas that most directly shape our own code.
+
+### 1. mbuf/mempool ownership is a lifetime problem
+
+An `rte_mbuf` is not separately heap-allocated. It is a slot inside a
+**mempool**, a fixed block of hugepage memory created at startup. "Freeing" an
+mbuf returns the slot to the pool, and freeing the *pool* unmaps the whole
+block. So every mbuf has an implicit lifetime bound: **it must not outlive its
+pool.** The NIC holds pool slots too: the RX descriptor ring is pre-filled with
+empty mbufs, so a started port references the pool even when software holds
+no mbufs.
+
+The reviewed repo wraps an mbuf as an owning pointer with no lifetime tied to
+the pool, and the pool's `Drop` frees it unconditionally. Safe code can
+therefore drop the pool first and then touch, or let the NIC DMA into, freed
+memory. That is a use-after-free that compiles, and its own test does it in
+the wrong order. In Rust you rule this out with one of two shapes:
+
+* **Borrowing:** `Mbuf<'pool>` holds a `&'pool MemPool`, so the borrow checker
+  refuses to drop the pool while any mbuf exists. This is precise, but the
+  lifetime spreads through every type that stores mbufs.
+* **Single owner, lend only:** one struct owns EAL, port, and pool, tears them
+  down in a fixed order in `Drop` (stop port → close → free pool → EAL
+  cleanup), and never hands out an mbuf, only a `&[u8]` inside a callback.
+  This is our planned design. It needs no new lifetime parameters, because
+  `PacketSource::poll`'s `F: FnMut(&[u8], RxMeta)` bound is *higher-ranked*
+  (`for<'a> FnMut(&'a [u8], RxMeta)`): the callback must accept a slice of any
+  lifetime, so it can't assume the slice lives past the call.
+
+The general lesson: whenever C hands you memory that belongs to something
+else, ask "what must outlive what?" and encode the answer in ownership or
+lifetimes. Don't rely on drop order happening to be right.
+
+### 2. Burst order is data, not an implementation detail
+
+`rte_eth_rx_burst` returns up to N packets in the order the NIC received
+them. The reviewed repo pushes them into an array and then calls `pop()`,
+which takes the **last** element first, so each burst of 32 is handed up in
+reverse. TCP doesn't notice because it reassembles by sequence number. Our
+`SequenceTracker` would see, for a burst carrying packets 33–64, packet 64
+first, then 63, …, 33. That reports a 31-packet gap followed by 31 "late"
+recoveries, every burst. (In the very first burst it's worse: packet 32
+becomes the baseline, so 31..1 are classified as duplicates and never
+delivered.) It inflates exactly the
+counters we use to judge feed health and makes every consumer see
+`Delivery::Late` data. A sequenced-feed receiver must iterate
+`pkts[0..n]` front to back. It's a one-word bug with system-wide
+consequences, which is why the DPDK test plan replays a known pcap and asserts
+zero reordering.
+
+### 3. Poll Mode Drivers vs interrupts
+
+Our `UdpSource` *blocks*: the thread sleeps in `recv_from`, and the kernel
+wakes it when a packet arrives. The wake path is NIC interrupt → driver/NAPI
+softirq → UDP stack → socket queue → scheduler makes our thread runnable →
+context switch → copy to user space. Every arrow can add microseconds of
+jitter, which is one plausible source of the tail we saw in the smoke runs.
+
+A DPDK **Poll Mode Driver** removes the interrupt and the kernel entirely. The
+NIC DMA-writes into an RX descriptor ring in our process's memory, and our
+thread spins reading the ring's "done" bits. There's no interrupt, no syscall,
+no wakeup, and no copy. The costs: the core runs at 100% even when the feed is
+idle; the port vanishes from Linux, along with `tcpdump`, ARP, IGMP, and SSH;
+and we must implement whatever protocol behavior we still need. Note that
+`SO_BUSY_POLL` on a kernel socket is a middle ground: the kernel polls the
+driver on our behalf while we're in `recv`, and it stays on the list of
+things to measure before DPDK.
+
+### 4. Why a C shim exists for `static inline` functions
+
+DPDK's hottest functions (`rte_eth_rx_burst`, `rte_pktmbuf_free`,
+`rte_pktmbuf_mtod`) are `static inline` in headers so that C callers get them
+inlined with no call overhead. `static inline` means **no symbol is exported**
+from `libdpdk.so`, so there is nothing for Rust's linker to bind to. bindgen
+can generate the declaration, but linking fails. The fix is a tiny C file
+compiled into our crate (via the `cc` crate) that wraps each one in a real
+function:
+
+```c
+uint16_t rust_eth_rx_burst(uint16_t port, uint16_t q, struct rte_mbuf **pkts, uint16_t n) {
+    return rte_eth_rx_burst(port, q, pkts, n);
+}
+```
+
+The cost is one non-inlined call per use, since Rust can't inline across the
+C boundary without cross-language LTO. That's why the planned design calls
+the shim once per *burst* (`rx_burst`, `free_bulk`) and reads per-packet mbuf
+fields (`data_off`, `data_len`, `ol_flags`) directly from the bindgen-generated
+struct instead of through a shim call each.
+
+### Check your understanding
+
+4. Suppose `DpdkSource::poll` delivered a burst in wire order but the
+   callback panicked on packet 5 of 32. Under the planned guard design, what
+   happens to the 32 mbufs, and what would happen without the guard?
+5. Our `UdpSource` takes a fresh `RxMeta::now()` per datagram, but the DPDK
+   design takes one per burst. Why is the per-burst stamp *not* less accurate
+   for DPDK? What does a per-packet stamp inside a burst actually measure?

@@ -7,6 +7,7 @@ machine.
 * Architecture: [`docs/architecture.md`](docs/architecture.md)
 * Wire protocol: [`docs/protocol.md`](docs/protocol.md)
 * Design notes and explanations: [`docs/learning-log.md`](docs/learning-log.md)
+* Research: [`rust-dpdk-net` review and DPDK backend design](docs/research/rust-dpdk-net-review.md)
 * Rules for contributors and AI agents: [`AGENTS.md`](AGENTS.md)
 
 ## Status
@@ -22,6 +23,7 @@ machine.
 | SPSC queue / multi-thread pipeline | Planned, pending measurements |
 | Linux `recvmmsg`, busy-poll, CPU affinity | Planned; blocked on a Linux environment |
 | AF_XDP experimental backend | Planned; blocked on a Linux environment |
+| DPDK backend (`caml-transport-dpdk`) | Designed only (see architecture section 9); not worth implementing for performance without a supported NIC |
 | Deployment to `camlcompute` | **Not authorized**; do not deploy |
 
 ## Setup (Windows)
