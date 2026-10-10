@@ -5,12 +5,11 @@
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
 use super::{PacketSource, RxMeta};
-use crate::clock::wall_clock_ns;
 
 /// Largest possible UDP payload is 65,507 bytes (IPv4). A receive buffer at
 /// least this large means a datagram can never be truncated, which matters
@@ -102,11 +101,7 @@ impl PacketSource for UdpSource {
     {
         match self.socket.recv_from(&mut self.buf) {
             Ok((len, _peer)) => {
-                let meta = RxMeta {
-                    rx_wall_ns: wall_clock_ns(),
-                    rx_instant: Instant::now(),
-                };
-                on_packet(&self.buf[..len], meta);
+                on_packet(&self.buf[..len], RxMeta::now());
                 Ok(1)
             }
             // Unix reports a read timeout as WouldBlock, Windows as TimedOut.
@@ -164,12 +159,15 @@ mod tests {
         let big = vec![0xAB; 65_507];
         tx.send_to(&big, src.local_addr().unwrap()).unwrap();
 
-        let mut got = 0;
+        let sent_at = crate::clock::wall_clock_ns();
+        let mut got = None;
         for _ in 0..50 {
-            if src.poll(|b, _| got = b.len()).unwrap() == 1 {
+            if src.poll(|b, m| got = Some((b.len(), m))).unwrap() == 1 {
                 break;
             }
         }
-        assert_eq!(got, big.len());
+        let (len, meta) = got.expect("datagram not received");
+        assert_eq!(len, big.len());
+        assert!(meta.rx_wall_ns >= sent_at);
     }
 }
