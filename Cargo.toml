@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/protocol",
+    "crates/engine",
+    "crates/sim",
+    "apps/receiver",
+    "apps/feed-generator",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+caml-protocol = { path = "crates/protocol" }
+caml-engine = { path = "crates/engine" }
+caml-sim = { path = "crates/sim" }
+socket2 = "0.6.5"
+clap = { version = "4.6", features = ["derive"] }
+ctrlc = "3.5"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
