@@ -40,6 +40,55 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --workspace --locked -- --ignored
 
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      # Publishes the badge JSON to the `badges` branch (master pushes only).
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the pinned toolchain and llvm-tools
+        run: rustup toolchain install && rustup component add llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Enable multicast on loopback
+        run: sudo ip link set lo multicast on
+      - name: Measure line coverage (library crates)
+        run: bash scripts/coverage.sh
+      - name: Job summary
+        run: |
+          pct=$(jq -r '.data[0].totals.lines.percent * 10 | round / 10' target/coverage.json)
+          {
+            echo "### Line coverage: ${pct}%"
+            echo
+            echo "Library crates only; \`apps/\` and \`tests/\` are excluded. Per file:"
+            echo
+            echo '```'
+            cat target/coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lcov
+          path: target/lcov.info
+      - name: Publish coverage badge
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pct=$(jq -r '.data[0].totals.lines.percent * 10 | round / 10' target/coverage.json)
+          color=$(awk -v p="$pct" 'BEGIN { print (p >= 90 ? "brightgreen" : p >= 80 ? "green" : p >= 70 ? "yellowgreen" : p >= 60 ? "yellow" : "red") }')
+          dir=$(mktemp -d)
+          printf '{"schemaVersion":1,"label":"coverage","message":"%s%%","color":"%s"}\n' "$pct" "$color" > "$dir/coverage.json"
+          cd "$dir"
+          git init -q -b badges
+          git add coverage.json
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "Coverage ${pct}% at ${GITHUB_SHA::7}"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-24.04

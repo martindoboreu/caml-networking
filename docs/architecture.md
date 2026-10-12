@@ -187,7 +187,7 @@ their tail loss cannot be proven or ruled out.
 |---|---|---|
 | Windows 11 Pro 26200, Ryzen 7 9800X3D, rustc 1.99.0 `x86_64-pc-windows-gnu` | **in use** | functional tests, loopback and in-process measurements |
 | GitHub Actions `ubuntu-24.04` + `windows-latest` | **in use** (github.com/martindoboreu/caml-networking) | all tests incl. Linux-only backend and multicast-on-`lo` |
-| WSL2 / Linux VM | **not installed** (owner's decision) | local Linux runs, AF_XDP on `veth` |
+| WSL2, Ubuntu 24.04 (`docs/linux-dev.md`) | **in use** | Linux-only tests, coverage, `recvmmsg` runs, later AF_XDP copy mode on `veth`; **not** for performance numbers (Hyper-V virtual NIC) |
 | Target box: Dell OptiPlex (Ultra) 11th-gen i7, 32 GB, Ubuntu 24.04, onboard I219-LM (13) `8086:15fb`, Thunderbolt 4 | **untouched; no access by policy** | deployment, real-NIC measurements |
 
 Loopback numbers measure the OS stack and scheduler, not a NIC. They must

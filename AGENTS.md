@@ -20,6 +20,9 @@
   `cargo test --workspace`, `cargo test --workspace --release`,
   `cargo +1.88 check --workspace --all-targets` (MSRV), and `cargo deny check`.
   Linux-only code must also pass clippy for `x86_64-unknown-linux-gnu`.
+  On Linux or WSL2, `bash scripts/check.sh` runs them all. Line coverage of
+  the library crates (`bash scripts/coverage.sh`) must not drop below the
+  floor CI enforces; new code comes with tests.
 * `unsafe` is forbidden workspace-wide. A crate that needs it must opt out
   explicitly in its own `[lints]` table (`unsafe_code = "deny"`, allowed only
   where needed), deny `clippy::undocumented_unsafe_blocks`, and document a
