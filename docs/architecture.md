@@ -4,8 +4,8 @@ Last updated: 2026-10-09 (milestone 2: integrity hardening, protocol v2,
 Linux batched backend, frame parser, benchmark harness).
 
 Status labels used throughout: **implemented**, **tested** (automated tests
-run on Windows), **CI-only** (tests exist but run only on Linux CI; not yet
-executed), **benchmarked**, **planned**, **blocked**.
+run on Windows), **CI-only** (tests run on Linux CI, not on a
+Linux machine here), **benchmarked**, **planned**, **blocked**.
 
 ## 1. Scope and system boundary
 
@@ -73,7 +73,7 @@ copy:
 | Backend | How it implements `poll` | Status |
 |---|---|---|
 | `UdpSource` | `recv_from` into an owned 64 KiB buffer, lend `&buf[..n]` | implemented, tested |
-| `RecvMmsgSource` (Linux) | one `recvmmsg` fills 32 slots; lend each; per-datagram kernel timestamp; kernel drop counter | implemented; **CI-only** (compiles for Linux, never executed here) |
+| `RecvMmsgSource` (Linux) | one `recvmmsg` fills 32 slots; lend each; per-datagram kernel timestamp | implemented; tested on Linux CI only |
 | AF_XDP | lend a UMEM frame's UDP payload (via `caml-frame`), recycle to the fill ring after the callback | planned |
 | DPDK | lend each mbuf's UDP payload in wire order, bulk-free the burst | design only; not on the I219 (D8) |
 
@@ -147,7 +147,7 @@ On a session change, outstanding gaps of the old session are counted as
 | Late join (first seq > `join_window` + 1) | baseline = first seq | `missed_before_join` (informational); earlier seqs → `before_baseline` |
 | Gap table full (1024) | oldest gap evicted | counted lost (`evicted`) |
 | Clock skew | `send_time > rx_time` | counted; excluded from latency |
-| Kernel socket-buffer overflow | Linux: `SO_RXQ_OVFL` | `TransportStats::kernel_drops` (CI-only) |
+| Kernel socket-buffer overflow | Linux, both socket backends: the socket's `sk_drops` counter from `/proc/net/udp`, read in `stats()` | `TransportStats::kernel_drops` (tested on Linux CI; exact: delivered + dropped == sent) |
 | Datagram > slot (Linux backend) | `MSG_TRUNC` | `TransportStats::truncated` |
 | Source not allowed | `allowed_sources` | `TransportStats::filtered_source` |
 
@@ -186,7 +186,7 @@ their tail loss cannot be proven or ruled out.
 | Environment | Status | Valid for |
 |---|---|---|
 | Windows 11 Pro 26200, Ryzen 7 9800X3D, rustc 1.99.0 `x86_64-pc-windows-gnu` | **in use** | functional tests, loopback and in-process measurements |
-| GitHub Actions `ubuntu-24.04` + `windows-latest` | **configured**, not yet run (no remote push) | all tests incl. Linux-only backend and multicast-on-`lo` |
+| GitHub Actions `ubuntu-24.04` + `windows-latest` | **in use** (github.com/martindoboreu/caml-networking) | all tests incl. Linux-only backend and multicast-on-`lo` |
 | WSL2 / Linux VM | **not installed** (owner's decision) | local Linux runs, AF_XDP on `veth` |
 | Target box: Dell OptiPlex (Ultra) 11th-gen i7, 32 GB, Ubuntu 24.04, onboard I219-LM (13) `8086:15fb`, Thunderbolt 4 | **untouched; no access by policy** | deployment, real-NIC measurements |
 
@@ -244,9 +244,9 @@ Gates on every commit (CI): fmt, clippy `-D warnings`, tests in debug
 
 ## 11. Main risks
 
-1. **Nothing has run on Linux yet.** The Linux backend and multicast-on-`lo`
-   tests are compile-checked only until CI runs or a Linux environment
-   exists.
+1. **Linux runs only in CI so far.** Linux-specific behavior is tested on
+   GitHub-hosted Ubuntu 24.04 VMs, not yet on a local Linux machine or the
+   target box. The first CI run found a real bug (decision D14).
 2. **Thunderbolt NIC stability.** Surprise removal, link retraining, and
    power management on the TB4 path must be engineered around (hardware plan
    §5).

@@ -200,7 +200,17 @@ impl PacketSource for UdpSource {
     }
 
     fn stats(&self) -> TransportStats {
-        self.stats
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut s = self.stats;
+            s.kernel_drops = super::procfs::socket_drops(self.socket.as_raw_fd());
+            s
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.stats
+        }
     }
 }
 
@@ -257,7 +267,33 @@ mod tests {
         assert!(src.granted_recv_buffer() > 0);
         let n = src.poll(|_, _| panic!("no packet expected")).unwrap();
         assert_eq!(n, 0);
-        assert_eq!(src.stats(), TransportStats::default());
+        let s = src.stats();
+        assert_eq!((s.datagrams, s.dropped()), (0, 0));
+        // Kernel drops are observable on Linux only.
+        assert_eq!(s.kernel_drops.is_some(), cfg!(target_os = "linux"));
+    }
+
+    /// Exact accounting on Linux: every datagram sent is either delivered
+    /// or counted in the kernel's drop counter.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_drops_are_counted_exactly() {
+        let cfg = UdpConfig {
+            recv_buffer_bytes: Some(4096),
+            ..loopback_any_port()
+        };
+        let mut src = UdpSource::bind(&cfg).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let burst = 500u64;
+        for _ in 0..burst {
+            tx.send_to(&[0xAB; 1000], src.local_addr().unwrap())
+                .unwrap();
+        }
+        let mut delivered = 0u64;
+        while src.poll(|_, _| delivered += 1).unwrap() > 0 {}
+        let drops = src.stats().kernel_drops.unwrap();
+        assert!(drops > 0, "the burst must overflow a 4 KiB buffer");
+        assert_eq!(delivered + drops, burst, "every datagram accounted for");
     }
 
     #[test]

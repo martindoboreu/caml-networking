@@ -22,8 +22,9 @@ use clap::{Parser, ValueEnum};
 enum Backend {
     /// Portable: one `recv_from` per datagram (all platforms).
     Udp,
-    /// Linux: batched `recvmmsg`, with kernel drop counts (`SO_RXQ_OVFL`)
-    /// and kernel receive timestamps (`SO_TIMESTAMPNS`).
+    /// Linux: batched `recvmmsg`, with kernel receive timestamps
+    /// (`SO_TIMESTAMPNS`). Kernel drop counts are read on Linux for both
+    /// backends.
     Recvmmsg,
 }
 
@@ -227,7 +228,7 @@ fn print_verdict(snapshot: &Snapshot, transport: &TransportStats) -> bool {
     }
     if transport.kernel_drops.is_none() {
         println!(
-            "  note: this backend cannot observe kernel socket-buffer drops; they appear as sequence gaps"
+            "  note: kernel socket-buffer drops are not observable on this platform; they appear as sequence gaps"
         );
     }
     clean

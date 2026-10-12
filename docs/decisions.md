@@ -84,6 +84,17 @@ length of 0 are the only two differences from `etherparse` found by
 100,000-frame differential testing, and both are deliberate.
 
 **D13. Linux backends use `nix`'s safe wrappers.**
-`recvmmsg`, `SO_RXQ_OVFL`, and `SO_TIMESTAMPNS` are reachable through `nix`
-without `unsafe` in our code, and `nix` was already a dependency (via
-`ctrlc`). The engine therefore keeps `forbid(unsafe_code)`.
+`recvmmsg` and `SO_TIMESTAMPNS` are reachable through `nix` without `unsafe`
+in our code, and `nix` was already a dependency (via `ctrlc`). The engine
+therefore keeps `forbid(unsafe_code)`.
+
+**D14. Kernel drops come from `/proc/net/udp`, not `SO_RXQ_OVFL`
+(2026-10-12, supersedes part of D13).** The first Linux CI run failed the
+exact-accounting test: `nix` 0.31's `recvmmsg` reuses message headers
+without restoring `msg_controllen`, which the kernel shrinks after each
+call, so the drop counter's control message was truncated and lost (and
+the original code ignored the truncation). Both Linux socket backends now
+read the socket's `sk_drops` from `/proc/net/udp` in `stats()` (a reporting
+path; `poll` stays allocation-free), and the batched backend requests only
+the fixed-size timestamp control message. *Revisit* if `nix` restores
+`msg_controllen` per call, or if per-datagram drop attribution is needed.

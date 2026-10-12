@@ -351,12 +351,23 @@ of memmove). A ring buffer pops the front in O(1), and because gaps are
 sorted, `partition_point` finds the right one in about 10 comparisons. The
 benchmark went from 64 ns to 3.3 ns per new gap.
 
-**Safe syscalls through `nix`.** `recvmmsg`, `SO_RXQ_OVFL`, and
-`SO_TIMESTAMPNS` are C APIs, but `nix` wraps them safely and promises no
-allocation in `recvmmsg`, so the engine still has zero `unsafe`. One subtle
-point: `nix` macros expand inside *our* crate, so we checked that
-`cmsg_space!` calls a safe function rather than emitting an `unsafe` block,
-which `forbid(unsafe_code)` would reject.
+**Safe syscalls through `nix`.** `recvmmsg` and `SO_TIMESTAMPNS` are C APIs,
+but `nix` wraps them safely and promises no allocation in `recvmmsg`, so the
+engine still has zero `unsafe`. One subtle point: `nix` macros expand inside
+*our* crate, so we checked that `cmsg_space!` calls a safe function rather
+than emitting an `unsafe` block, which `forbid(unsafe_code)` would reject.
+
+**What the first Linux run taught us.** The code compiled for Linux on
+Windows and looked right, and the very first CI run on real Linux still
+failed one test: "every sent datagram is either delivered or counted as a
+kernel drop". The cause was a stateful API. `recvmmsg` writes the number of
+control-message bytes it used back into each reusable header, and `nix`
+never resets it, so from the second call on there was only room for the
+timestamp, and the drop counter (`SO_RXQ_OVFL`) was silently truncated. Two
+lessons: *compiling is not running* (that's why the status label "CI-only"
+exists), and *a test that asserts exact accounting catches what a test that
+only checks "something arrived" never will*. The fix reads the kernel's
+per-socket drop counter from `/proc/net/udp` instead (decision D14).
 
 **Differential testing.** The new Ethernet/IPv4/UDP parser is compared with
 an independent library (`etherparse`) on 100,000 randomly mutated frames.

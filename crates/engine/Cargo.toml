@@ -19,6 +19,6 @@ caml-sim.workspace = true
 workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Safe wrappers for recvmmsg, SO_RXQ_OVFL, and SO_TIMESTAMPNS (already in the
+# Safe wrappers for recvmmsg and SO_TIMESTAMPNS (already in the
 # dependency tree via ctrlc).
 nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net"] }

@@ -26,11 +26,12 @@ Labels: **implemented**, **tested** (automated, run on Windows), **CI-only**
 | Session gate, sequencer, integrity verdict | implemented, tested (unit, adversarial, property, end-to-end) |
 | Zero allocations on the receive path | tested (counting allocator) |
 | Portable UDP backend (`recv_from`), multicast, source allowlist | implemented, tested on Windows loopback |
-| Linux `recvmmsg` backend with kernel drop counts and kernel timestamps | implemented; **CI-only** (compiles for Linux; never executed) |
+| Linux `recvmmsg` backend (batching, kernel receive timestamps) | implemented; **CI-only** (tested on Linux CI, not on a Linux machine here) |
+| Kernel drop counts on Linux (both socket backends, exact accounting) | implemented; **CI-only** |
 | Frame parser for raw-packet backends (`caml-frame`) | implemented, tested (incl. differential vs `etherparse`) |
 | pcap output of the synthetic feed | implemented, tested |
 | Benchmark harness (`caml-bench`) and Windows baseline | implemented, benchmarked (Windows loopback only) |
-| CI (Ubuntu 24.04 + Windows, debug + release, MSRV, `cargo deny`) | configured; not yet run (no remote) |
+| CI (Ubuntu 24.04 + Windows, debug + release, MSRV, `cargo deny`) | in use: [Actions](https://github.com/martindoboreu/caml-networking/actions) |
 | AF_XDP backend (`caml-transport-xdp`) | planned; needs a Linux environment |
 | External Thunderbolt NIC for zero-copy bypass | planned; see hardware plan |
 | DPDK backend | design only; **not on the onboard I219** (D8) |
@@ -90,8 +91,8 @@ Useful options:
 
 * `caml-recv --fail-on-loss`: exit status 2 on any loss, rejection, or
   malformed datagram (for scripts and CI).
-* `caml-recv --backend recvmmsg` (Linux): batched receive with kernel drop
-  counts and kernel timestamps.
+* `caml-recv --backend recvmmsg` (Linux): batched receive with kernel
+  receive timestamps. On Linux both backends report kernel drop counts.
 * Multicast on loopback: `caml-recv --group 239.77.0.9 --iface 127.0.0.1
   --reuse-address` and `caml-feed --target 239.77.0.9:40000`.
 * `caml-feed --no-end-of-session` simulates a publisher crash;

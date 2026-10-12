@@ -1,18 +1,22 @@
-//! Linux btched UDP backend: one `recvmmsg` system call returns up to
+//! Linux batched UDP backend: one `recvmmsg` system call returns up to
 //! [`BATCH`] datagrams.
 //!
-//! Compared with [`UdpSource`](super::UdpSource) it adds two things the
-//! portable backend cannot observe:
+//! Compared with [`UdpSource`](super::UdpSource) it adds:
 //!
-//! * **Kernel drops.** `SO_RXQ_OVFL` makes the kernel attach the socket's
-//!   cumulative drop counter (datagrams discarded because the receive buffer
-//!   was full) to received datagrams, reported as
-//!   [`TransportStats::kernel_drops`]. The counter only travels with a
-//!   delivered datagram, so drops after the last one received are reported
-//!   when the next one arrives.
+//! * **Batching.** One system call per batch instead of per datagram.
 //! * **Kernel receive timestamps.** `SO_TIMESTAMPNS` stamps each datagram
 //!   when the kernel received it, reported as [`RxMeta::rx_kernel_ns`]. The
 //!   gap to the user-space stamp is socket queueing plus wakeup.
+//!
+//! Kernel drops are reported like `UdpSource` on Linux: from the socket's
+//! `sk_drops` counter in `/proc/net/udp`, read in [`PacketSource::stats`].
+//!
+//! Control-message buffer note: `nix` 0.31's `recvmmsg` reuses its message
+//! headers without restoring `msg_controllen`, which the kernel shrinks to the
+//! bytes it used on the previous call. Only the timestamp is requested, so
+//! every datagram's control data is the same 32 bytes and always fits; a
+//! second control message (e.g. `SO_RXQ_OVFL`) would be truncated. Tests
+//! cover many reuses of the same headers.
 //!
 //! Uses `nix`'s safe wrappers; this module contains no `unsafe`. All buffers
 //! and message headers are allocated once in [`RecvMmsgSource::bind`]; `poll`
@@ -65,22 +69,18 @@ fn source_ip(addr: &SockaddrStorage) -> Option<IpAddr> {
 
 impl RecvMmsgSource {
     /// Creates and binds the socket (same configuration as
-    /// [`UdpSource`](super::UdpSource)), enables drop reporting and kernel
-    /// timestamps, and allocates every buffer.
+    /// [`UdpSource`](super::UdpSource)), enables kernel timestamps, and
+    /// allocates every buffer.
     pub fn bind(config: &UdpConfig) -> io::Result<Self> {
         let (socket, granted_recv_buffer) = open_socket(config)?;
-        setsockopt(&socket, sockopt::RxqOvfl, &1)?;
         setsockopt(&socket, sockopt::ReceiveTimestampns, &true)?;
         Ok(Self {
             socket,
             slots: vec![[0u8; SLOT_LEN]; BATCH].into_boxed_slice(),
-            headers: MultiHeaders::preallocate(BATCH, Some(nix::cmsg_space!(TimeSpec, u32))),
+            headers: MultiHeaders::preallocate(BATCH, Some(nix::cmsg_space!(TimeSpec))),
             allowed_sources: config.allowed_sources.clone().into_boxed_slice(),
             granted_recv_buffer,
-            stats: TransportStats {
-                kernel_drops: Some(0),
-                ..TransportStats::default()
-            },
+            stats: TransportStats::default(),
         })
     }
 
@@ -145,18 +145,13 @@ impl PacketSource for RecvMmsgSource {
         for msg in results {
             stats.datagrams = stats.datagrams.saturating_add(1);
             let mut meta = batch_meta;
+            // `cmsgs()` fails only on control-data truncation, which leaves
+            // this datagram without a kernel stamp (visible as fewer
+            // `kernel_to_rx` samples than datagrams), never without data.
             if let Ok(cmsgs) = msg.cmsgs() {
                 for cmsg in cmsgs {
-                    match cmsg {
-                        ControlMessageOwned::ScmTimestampns(ts) => {
-                            meta.rx_kernel_ns = timespec_ns(&ts);
-                        }
-                        ControlMessageOwned::RxqOvfl(dropped) => {
-                            let dropped = u64::from(dropped);
-                            stats.kernel_drops =
-                                Some(stats.kernel_drops.map_or(dropped, |k| k.max(dropped)));
-                        }
-                        _ => {}
+                    if let ControlMessageOwned::ScmTimestampns(ts) = cmsg {
+                        meta.rx_kernel_ns = timespec_ns(&ts);
                     }
                 }
             }
@@ -183,7 +178,9 @@ impl PacketSource for RecvMmsgSource {
     }
 
     fn stats(&self) -> TransportStats {
-        self.stats
+        let mut s = self.stats;
+        s.kernel_drops = super::procfs::socket_drops(self.socket.as_raw_fd());
+        s
     }
 }
 
@@ -202,11 +199,13 @@ mod tests {
         }
     }
 
+    /// Polls until `want` datagrams have been received or the socket is
+    /// idle, collecting `(len, meta)` of every delivered datagram.
     fn drain(src: &mut RecvMmsgSource, want: u64) -> Vec<(usize, RxMeta)> {
         let mut got = Vec::new();
         for _ in 0..200 {
-            src.poll(|b, m| got.push((b.len(), m))).unwrap();
-            if src.stats().datagrams >= want {
+            let n = src.poll(|b, m| got.push((b.len(), m))).unwrap();
+            if src.stats.datagrams >= want || (n == 0 && src.stats.datagrams > 0) {
                 break;
             }
         }
@@ -214,17 +213,26 @@ mod tests {
     }
 
     #[test]
-    fn receives_batches_with_kernel_timestamps() {
+    fn receives_batches_with_kernel_timestamps_across_header_reuse() {
         let mut src = RecvMmsgSource::bind(&config()).unwrap();
         let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        for i in 0..100u8 {
-            tx.send_to(&[i; 64], src.local_addr().unwrap()).unwrap();
+        let target = src.local_addr().unwrap();
+        // Ten bursts: the preallocated headers are reused many times, which
+        // is where control-buffer shrinkage would show up.
+        let mut got = Vec::new();
+        for burst in 0..10u8 {
+            for _ in 0..100 {
+                tx.send_to(&[burst; 64], target).unwrap();
+            }
+            let want = src.stats.datagrams + 100;
+            got.extend(drain(&mut src, want));
         }
-        let got = drain(&mut src, 100);
-        assert_eq!(got.len(), 100);
+        assert_eq!(got.len(), 1_000);
         for (len, meta) in &got {
             assert_eq!(*len, 64);
-            let kernel = meta.rx_kernel_ns.expect("SO_TIMESTAMPNS stamp");
+            let kernel = meta
+                .rx_kernel_ns
+                .expect("SO_TIMESTAMPNS stamp on every datagram");
             assert!(kernel <= meta.rx_wall_ns);
         }
         assert_eq!(src.stats().kernel_drops, Some(0));
@@ -244,14 +252,10 @@ mod tests {
         for _ in 0..burst {
             tx.send_to(&[0xAB; 1000], target).unwrap();
         }
-        let mut delivered = drain(&mut src, burst).len() as u64;
-        // The drop counter travels with the next delivered datagram.
-        tx.send_to(&[0xCD; 10], target).unwrap();
-        let before = src.stats().datagrams;
-        delivered += drain(&mut src, before + 1).len() as u64;
+        let delivered = drain(&mut src, burst).len() as u64;
         let drops = src.stats().kernel_drops.unwrap();
         assert!(drops > 0, "the burst must overflow a 4 KiB buffer");
-        assert_eq!(delivered + drops, burst + 1, "every datagram accounted for");
+        assert_eq!(delivered + drops, burst, "every datagram accounted for");
     }
 
     #[test]

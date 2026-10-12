@@ -11,6 +11,8 @@ use std::time::Instant;
 use crate::clock::wall_clock_ns;
 
 #[cfg(target_os = "linux")]
+mod procfs;
+#[cfg(target_os = "linux")]
 mod recvmmsg;
 mod udp;
 
@@ -66,9 +68,10 @@ pub struct TransportStats {
     /// Transient receive errors that were counted and survived (e.g. an ICMP
     /// error reported on a UDP socket).
     pub transient_errors: u64,
-    /// Datagrams the kernel dropped before we could read them (socket
-    /// buffer overflow), if the backend can observe it. `None` means "not
-    /// observable on this backend", not zero.
+    /// Datagrams the kernel dropped for this socket before we could read
+    /// them (mostly receive-buffer overflow), if the platform exposes it.
+    /// Linux socket backends read the kernel's `sk_drops` counter from
+    /// `/proc/net/udp`. `None` means "not observable here", not zero.
     pub kernel_drops: Option<u64>,
 }
 
@@ -107,6 +110,9 @@ pub trait PacketSource {
         F: FnMut(&[u8], RxMeta);
 
     /// Transport-level counters.
+    ///
+    /// May read the OS (e.g. `/proc` on Linux) and allocate: call it from
+    /// reporting paths, not per packet.
     fn stats(&self) -> TransportStats;
 }
 
