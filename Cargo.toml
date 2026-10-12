@@ -18,6 +18,7 @@ edition = "2024"
 # need 1.88). CI checks this; `rust-toolchain.toml` pins the dev toolchain.
 rust-version = "1.88"
 publish = false
+license = "MIT"
 
 [workspace.dependencies]
 caml-protocol = { path = "crates/protocol" }

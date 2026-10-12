@@ -122,3 +122,7 @@ apps/feed-generator    caml-feed CLI
 apps/bench             caml-bench CLI
 docs/                  architecture, protocol, decisions, benchmarks, hardware plan, learning log
 ```
+
+## License
+
+MIT; see [`LICENSE`](LICENSE).
