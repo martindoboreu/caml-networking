@@ -4,11 +4,12 @@ pub(crate) mod header {
     pub(crate) const MAGIC: usize = 0;
     pub(crate) const VERSION: usize = 2;
     pub(crate) const FLAGS: usize = 3;
-    pub(crate) const SESSION_ID: usize = 4;
-    pub(crate) const PACKET_SEQ: usize = 8;
-    pub(crate) const SEND_TIME_NS: usize = 16;
-    pub(crate) const MSG_COUNT: usize = 24;
-    pub(crate) const RESERVED: usize = 26;
+    pub(crate) const MSG_COUNT: usize = 4;
+    pub(crate) const RESERVED: usize = 6;
+    pub(crate) const RESERVED_LEN: usize = 2;
+    pub(crate) const SESSION_EPOCH: usize = 8;
+    pub(crate) const FIRST_SEQ: usize = 16;
+    pub(crate) const SEND_TIME_NS: usize = 24;
 }
 
 pub(crate) mod message {

@@ -3,6 +3,7 @@ name = "caml-engine"
 description = "CAML market-data receive engine: transports, sequencing, metrics, pipeline."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
@@ -10,7 +11,13 @@ caml-protocol.workspace = true
 socket2.workspace = true
 
 [dev-dependencies]
+caml-alloc-count.workspace = true
 caml-sim.workspace = true
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Safe wrappers for recvmmsg, SO_RXQ_OVFL, and SO_TIMESTAMPNS (already in the
+# dependency tree via ctrlc).
+nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net"] }

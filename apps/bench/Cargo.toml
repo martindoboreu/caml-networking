@@ -1,0 +1,16 @@
+[package]
+name = "caml-bench"
+description = "Reproducible CAML benchmarks: in-process microbenchmarks and repeated loopback runs."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+caml-engine.workspace = true
+caml-protocol.workspace = true
+caml-sim.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

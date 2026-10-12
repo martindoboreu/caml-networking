@@ -1,8 +1,9 @@
 [package]
 name = "caml-recv"
-description = "Receives the CAML synthetic UDP feed and reports integrity and latency metrics."
+description = "Receives the CAML UDP feed and reports integrity and latency metrics."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]

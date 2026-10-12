@@ -2,7 +2,7 @@ use std::fmt;
 
 use caml_protocol::{
     EncodeError, MAX_PAYLOAD_1500_MTU, MarketEvent, MessageType, PRICE_SCALE, PacketWriter, Price,
-    max_messages_for_payload,
+    max_messages_for_payload, packet_len, write_heartbeat,
 };
 
 use crate::SplitMix64;
@@ -10,11 +10,12 @@ use crate::SplitMix64;
 /// Synthetic feed parameters.
 #[derive(Clone, Debug)]
 pub struct FeedConfig {
-    /// Publisher session id written into every packet.
-    pub session_id: u32,
+    /// Publisher session epoch written into every packet. Must be non-zero;
+    /// a real publisher uses its start time in ns since the Unix epoch.
+    pub session_epoch: u64,
     /// Number of instruments, with ids `1..=instruments`.
     pub instruments: u32,
-    /// Messages per packet. Zero produces heartbeats only.
+    /// Messages per data packet (at least 1).
     pub msgs_per_packet: u16,
     /// Largest packet the simulator may produce, in bytes.
     pub max_payload: usize,
@@ -25,7 +26,7 @@ pub struct FeedConfig {
 impl Default for FeedConfig {
     fn default() -> Self {
         Self {
-            session_id: 1,
+            session_epoch: 1,
             instruments: 8,
             msgs_per_packet: 4,
             max_payload: MAX_PAYLOAD_1500_MTU,
@@ -53,34 +54,38 @@ const START_MID: i64 = 100 * PRICE_SCALE;
 
 /// Generates a random-walk market and encodes it into packets.
 ///
-/// Packet and message sequence numbers both start at 1 and increase by one.
+/// Message sequence numbers start at 1 and increase by one per message;
+/// heartbeats announce the next one.
 #[derive(Debug)]
 pub struct FeedSimulator {
     config: FeedConfig,
     rng: SplitMix64,
     mids: Vec<i64>,
-    next_packet_seq: u64,
-    next_msg_seq: u64,
+    next_seq: u64,
+    data_packets: u64,
 }
 
 impl FeedSimulator {
     /// Validates `config` and creates a simulator.
     pub fn new(config: FeedConfig) -> Result<Self, ConfigError> {
+        if config.session_epoch == 0 {
+            return Err(ConfigError("session_epoch must be non-zero".into()));
+        }
         if config.instruments == 0 {
             return Err(ConfigError("instruments must be at least 1".into()));
         }
         let max_msgs = max_messages_for_payload(config.max_payload);
-        if usize::from(config.msgs_per_packet) > max_msgs {
+        if config.msgs_per_packet == 0 || usize::from(config.msgs_per_packet) > max_msgs {
             return Err(ConfigError(format!(
-                "msgs_per_packet {} exceeds {} that fit in a {}-byte payload",
-                config.msgs_per_packet, max_msgs, config.max_payload
+                "msgs_per_packet must be 1..={max_msgs} for a {}-byte payload, got {}",
+                config.max_payload, config.msgs_per_packet
             )));
         }
         Ok(Self {
             rng: SplitMix64::new(config.seed),
             mids: vec![START_MID; config.instruments as usize],
-            next_packet_seq: 1,
-            next_msg_seq: 1,
+            next_seq: 1,
+            data_packets: 0,
             config,
         })
     }
@@ -90,41 +95,50 @@ impl FeedSimulator {
         &self.config
     }
 
-    /// Sequence number the next packet will carry.
-    pub fn next_packet_seq(&self) -> u64 {
-        self.next_packet_seq
-    }
-
     /// Sequence number the next message will carry.
-    pub fn next_msg_seq(&self) -> u64 {
-        self.next_msg_seq
+    pub fn next_seq(&self) -> u64 {
+        self.next_seq
     }
 
-    /// Encodes the next packet into `buf` and returns its length.
+    /// Data packets generated so far.
+    pub fn data_packets(&self) -> u64 {
+        self.data_packets
+    }
+
+    /// Encodes the next data packet into `buf` and returns its length.
     ///
-    /// `now_ns` is used both as the event time and as the send timestamp;
-    /// callers should pass a fresh clock reading immediately before sending.
+    /// `now_ns` is used as the event time and as the initial send timestamp.
+    /// On error nothing is consumed: the next call produces the same
+    /// sequence numbers.
     pub fn next_packet(&mut self, buf: &mut [u8], now_ns: u64) -> Result<usize, EncodeError> {
-        let mut w = PacketWriter::new(buf, self.config.session_id, self.next_packet_seq)?;
-        for _ in 0..self.config.msgs_per_packet {
-            let event = self.next_event(now_ns);
-            w.push(&event)?;
-            self.next_msg_seq += 1;
+        let needed = packet_len(self.config.msgs_per_packet);
+        if buf.len() < needed {
+            return Err(EncodeError::BufferFull {
+                needed,
+                available: buf.len(),
+            });
         }
-        self.next_packet_seq += 1;
+        let mut w = PacketWriter::new(buf, self.config.session_epoch, self.next_seq)?;
+        for _ in 0..self.config.msgs_per_packet {
+            let event = self.next_event(now_ns, w.next_seq());
+            w.push(&event)?;
+        }
+        self.next_seq = w.next_seq();
+        self.data_packets += 1;
         Ok(w.finish(now_ns))
     }
 
-    /// Encodes a heartbeat (a packet with no messages) into `buf` and returns
-    /// its length. Heartbeats consume a packet sequence number, so a receiver
-    /// can detect loss of the data packet before them.
-    pub fn next_heartbeat(&mut self, buf: &mut [u8], now_ns: u64) -> Result<usize, EncodeError> {
-        let w = PacketWriter::new(buf, self.config.session_id, self.next_packet_seq)?;
-        self.next_packet_seq += 1;
-        Ok(w.finish(now_ns))
+    /// Encodes a heartbeat announcing the next sequence number.
+    pub fn next_heartbeat(&self, buf: &mut [u8], now_ns: u64) -> Result<usize, EncodeError> {
+        write_heartbeat(buf, self.config.session_epoch, self.next_seq, false, now_ns)
     }
 
-    fn next_event(&mut self, now_ns: u64) -> MarketEvent {
+    /// Encodes the session's final, end-of-session heartbeat.
+    pub fn end_of_session(&self, buf: &mut [u8], now_ns: u64) -> Result<usize, EncodeError> {
+        write_heartbeat(buf, self.config.session_epoch, self.next_seq, true, now_ns)
+    }
+
+    fn next_event(&mut self, now_ns: u64, seq: u64) -> MarketEvent {
         let idx = self.rng.below(self.mids.len() as u64) as usize;
         let step = self.rng.below(3) as i64 - 1;
         let mid = (self.mids[idx] + step * TICK).max(TICK);
@@ -138,7 +152,7 @@ impl FeedSimulator {
         MarketEvent {
             msg_type,
             instrument_id: idx as u32 + 1,
-            seq: self.next_msg_seq,
+            seq,
             event_time_ns: now_ns,
             price: Price::from_raw(price),
             quantity: 1 + self.rng.below(1000),
@@ -153,51 +167,68 @@ mod tests {
 
     #[test]
     fn rejects_bad_config() {
-        assert!(
-            FeedSimulator::new(FeedConfig {
+        for bad in [
+            FeedConfig {
                 instruments: 0,
                 ..FeedConfig::default()
-            })
-            .is_err()
-        );
-        assert!(
-            FeedSimulator::new(FeedConfig {
+            },
+            FeedConfig {
                 msgs_per_packet: 37,
                 ..FeedConfig::default()
-            })
-            .is_err()
-        );
+            },
+            FeedConfig {
+                msgs_per_packet: 0,
+                ..FeedConfig::default()
+            },
+            FeedConfig {
+                session_epoch: 0,
+                ..FeedConfig::default()
+            },
+        ] {
+            assert!(FeedSimulator::new(bad).is_err());
+        }
     }
 
     #[test]
     fn produces_contiguous_valid_packets() {
         let mut sim = FeedSimulator::new(FeedConfig::default()).unwrap();
         let mut buf = [0u8; MAX_PAYLOAD_1500_MTU];
-        let mut expected_msg = 1;
-        for expected_pkt in 1..=100u64 {
+        let mut expected = 1;
+        for _ in 0..100 {
             let len = sim.next_packet(&mut buf, 42).unwrap();
             let view = parse_packet(&buf[..len]).unwrap();
-            assert_eq!(view.header().packet_seq, expected_pkt);
+            assert_eq!(view.header().first_seq, expected);
             for ev in view.messages() {
-                assert_eq!(ev.seq, expected_msg);
+                assert_eq!(ev.seq, expected);
                 assert!((1..=8).contains(&ev.instrument_id));
                 assert!(ev.price.raw() > 0);
-                expected_msg += 1;
+                expected += 1;
             }
         }
+        assert_eq!(sim.data_packets(), 100);
     }
 
     #[test]
-    fn heartbeat_consumes_packet_seq_only() {
+    fn heartbeats_announce_next_seq() {
         let mut sim = FeedSimulator::new(FeedConfig::default()).unwrap();
         let mut buf = [0u8; MAX_PAYLOAD_1500_MTU];
         sim.next_packet(&mut buf, 1).unwrap();
         let len = sim.next_heartbeat(&mut buf, 2).unwrap();
-        let view = parse_packet(&buf[..len]).unwrap();
-        assert_eq!(view.header().packet_seq, 2);
-        assert_eq!(view.header().msg_count, 0);
-        assert_eq!(sim.next_packet_seq(), 3);
-        assert_eq!(sim.next_msg_seq(), 5);
+        let h = *parse_packet(&buf[..len]).unwrap().header();
+        assert_eq!((h.msg_count, h.first_seq, h.end_of_session), (0, 5, false));
+        let len = sim.end_of_session(&mut buf, 3).unwrap();
+        let h = *parse_packet(&buf[..len]).unwrap().header();
+        assert_eq!((h.first_seq, h.end_of_session), (5, true));
+        assert_eq!(sim.next_seq(), 5);
+    }
+
+    #[test]
+    fn short_buffer_consumes_nothing() {
+        let mut sim = FeedSimulator::new(FeedConfig::default()).unwrap();
+        let mut small = [0u8; 100];
+        assert!(sim.next_packet(&mut small, 1).is_err());
+        assert_eq!(sim.next_seq(), 1);
+        assert_eq!(sim.data_packets(), 0);
     }
 
     #[test]

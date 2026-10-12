@@ -1,14 +1,16 @@
 [package]
 name = "caml-feed"
-description = "Synthetic CAML market-data UDP publisher with optional fault injection."
+description = "Synthetic CAML market-data UDP publisher with fault injection and pcap output."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
 caml-protocol.workspace = true
 caml-sim.workspace = true
 clap.workspace = true
+socket2.workspace = true
 
 [lints]
 workspace = true

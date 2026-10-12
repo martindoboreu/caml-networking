@@ -3,6 +3,7 @@ name = "caml-protocol"
 description = "CAML market-data wire protocol: encoding and zero-copy decoding. No I/O."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 publish.workspace = true
 
 [lints]

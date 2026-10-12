@@ -21,8 +21,24 @@ pub enum DecodeError {
         /// Version found.
         found: u8,
     },
-    /// Header flags or reserved bytes are non-zero.
+    /// Header flags contain an undefined bit, or
+    /// [`FLAG_END_OF_SESSION`](crate::FLAG_END_OF_SESSION) is set on a packet
+    /// that carries messages.
+    InvalidFlags {
+        /// Flags byte found.
+        flags: u8,
+    },
+    /// Header reserved bytes are non-zero.
     ReservedNonZero,
+    /// `session_epoch` is zero.
+    ZeroSessionEpoch,
+    /// `first_seq` is zero, or `first_seq + msg_count` overflows `u64`.
+    InvalidSeqRange {
+        /// `first_seq` found.
+        first_seq: u64,
+        /// `msg_count` found.
+        msg_count: u16,
+    },
     /// Datagram length disagrees with `msg_count`.
     LengthMismatch {
         /// Length implied by the header.
@@ -49,6 +65,15 @@ pub enum DecodeError {
         /// Zero-based index of the message in the packet.
         index: u16,
     },
+    /// A message's `seq` is not `first_seq + index`.
+    MessageSeqMismatch {
+        /// Zero-based index of the message in the packet.
+        index: u16,
+        /// Sequence number implied by the header.
+        expected: u64,
+        /// Sequence number found in the message.
+        found: u64,
+    },
 }
 
 /// Field-free classification of [`DecodeError`], usable as a metrics index.
@@ -60,8 +85,14 @@ pub enum DecodeErrorKind {
     BadMagic,
     /// See [`DecodeError::UnsupportedVersion`].
     UnsupportedVersion,
+    /// See [`DecodeError::InvalidFlags`].
+    InvalidFlags,
     /// See [`DecodeError::ReservedNonZero`].
     ReservedNonZero,
+    /// See [`DecodeError::ZeroSessionEpoch`].
+    ZeroSessionEpoch,
+    /// See [`DecodeError::InvalidSeqRange`].
+    InvalidSeqRange,
     /// See [`DecodeError::LengthMismatch`].
     LengthMismatch,
     /// See [`DecodeError::BadMessageLength`].
@@ -70,22 +101,28 @@ pub enum DecodeErrorKind {
     UnknownMessageType,
     /// See [`DecodeError::MessageFlagsNonZero`].
     MessageFlagsNonZero,
+    /// See [`DecodeError::MessageSeqMismatch`].
+    MessageSeqMismatch,
 }
 
 impl DecodeErrorKind {
     /// Number of variants.
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 12;
 
     /// All variants, in index order.
     pub const ALL: [Self; Self::COUNT] = [
         Self::TooShort,
         Self::BadMagic,
         Self::UnsupportedVersion,
+        Self::InvalidFlags,
         Self::ReservedNonZero,
+        Self::ZeroSessionEpoch,
+        Self::InvalidSeqRange,
         Self::LengthMismatch,
         Self::BadMessageLength,
         Self::UnknownMessageType,
         Self::MessageFlagsNonZero,
+        Self::MessageSeqMismatch,
     ];
 
     /// Dense index in `0..COUNT`.
@@ -99,11 +136,15 @@ impl DecodeErrorKind {
             Self::TooShort => "too_short",
             Self::BadMagic => "bad_magic",
             Self::UnsupportedVersion => "unsupported_version",
+            Self::InvalidFlags => "invalid_flags",
             Self::ReservedNonZero => "reserved_non_zero",
+            Self::ZeroSessionEpoch => "zero_session_epoch",
+            Self::InvalidSeqRange => "invalid_seq_range",
             Self::LengthMismatch => "length_mismatch",
             Self::BadMessageLength => "bad_message_length",
             Self::UnknownMessageType => "unknown_message_type",
             Self::MessageFlagsNonZero => "message_flags_non_zero",
+            Self::MessageSeqMismatch => "message_seq_mismatch",
         }
     }
 }
@@ -115,11 +156,15 @@ impl DecodeError {
             Self::TooShort { .. } => DecodeErrorKind::TooShort,
             Self::BadMagic { .. } => DecodeErrorKind::BadMagic,
             Self::UnsupportedVersion { .. } => DecodeErrorKind::UnsupportedVersion,
+            Self::InvalidFlags { .. } => DecodeErrorKind::InvalidFlags,
             Self::ReservedNonZero => DecodeErrorKind::ReservedNonZero,
+            Self::ZeroSessionEpoch => DecodeErrorKind::ZeroSessionEpoch,
+            Self::InvalidSeqRange { .. } => DecodeErrorKind::InvalidSeqRange,
             Self::LengthMismatch { .. } => DecodeErrorKind::LengthMismatch,
             Self::BadMessageLength { .. } => DecodeErrorKind::BadMessageLength,
             Self::UnknownMessageType { .. } => DecodeErrorKind::UnknownMessageType,
             Self::MessageFlagsNonZero { .. } => DecodeErrorKind::MessageFlagsNonZero,
+            Self::MessageSeqMismatch { .. } => DecodeErrorKind::MessageSeqMismatch,
         }
     }
 }
@@ -130,7 +175,16 @@ impl fmt::Display for DecodeError {
             Self::TooShort { len } => write!(f, "datagram too short ({len} bytes)"),
             Self::BadMagic { found } => write!(f, "bad magic {found:02x?}"),
             Self::UnsupportedVersion { found } => write!(f, "unsupported version {found}"),
-            Self::ReservedNonZero => write!(f, "header flags/reserved bytes are non-zero"),
+            Self::InvalidFlags { flags } => write!(f, "invalid header flags {flags:#04x}"),
+            Self::ReservedNonZero => write!(f, "header reserved bytes are non-zero"),
+            Self::ZeroSessionEpoch => write!(f, "session_epoch is zero"),
+            Self::InvalidSeqRange {
+                first_seq,
+                msg_count,
+            } => write!(
+                f,
+                "invalid sequence range: first_seq={first_seq} msg_count={msg_count}"
+            ),
             Self::LengthMismatch { expected, actual } => {
                 write!(
                     f,
@@ -144,6 +198,11 @@ impl fmt::Display for DecodeError {
                 write!(f, "message {index}: unknown type {msg_type}")
             }
             Self::MessageFlagsNonZero { index } => write!(f, "message {index}: non-zero flags"),
+            Self::MessageSeqMismatch {
+                index,
+                expected,
+                found,
+            } => write!(f, "message {index}: seq {found}, expected {expected}"),
         }
     }
 }
@@ -162,6 +221,17 @@ pub enum EncodeError {
     },
     /// The packet already holds `u16::MAX` messages.
     TooManyMessages,
+    /// `session_epoch` must be non-zero.
+    ZeroSessionEpoch,
+    /// Sequence numbers start at 1 and the packet's range must fit in `u64`.
+    InvalidSeq,
+    /// The pushed event's `seq` is not the next one in the packet.
+    SeqMismatch {
+        /// Sequence number the packet needs next.
+        expected: u64,
+        /// Sequence number of the pushed event.
+        found: u64,
+    },
 }
 
 impl fmt::Display for EncodeError {
@@ -171,6 +241,14 @@ impl fmt::Display for EncodeError {
                 write!(f, "buffer full: need {needed} bytes, have {available}")
             }
             Self::TooManyMessages => write!(f, "packet message count would exceed u16::MAX"),
+            Self::ZeroSessionEpoch => write!(f, "session_epoch must be non-zero"),
+            Self::InvalidSeq => write!(f, "sequence numbers must start at 1 and fit in u64"),
+            Self::SeqMismatch { expected, found } => {
+                write!(
+                    f,
+                    "event seq {found} does not follow the packet (expected {expected})"
+                )
+            }
         }
     }
 }
@@ -185,6 +263,15 @@ mod tests {
     fn kind_indices_are_dense_and_ordered() {
         for (i, kind) in DecodeErrorKind::ALL.iter().enumerate() {
             assert_eq!(kind.index(), i);
+        }
+    }
+
+    #[test]
+    fn kind_names_are_unique() {
+        for (i, a) in DecodeErrorKind::ALL.iter().enumerate() {
+            for b in &DecodeErrorKind::ALL[i + 1..] {
+                assert_ne!(a.name(), b.name());
+            }
         }
     }
 }

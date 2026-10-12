@@ -53,6 +53,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
+name = "autocfg"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -68,30 +80,55 @@ dependencies = [
 ]
 
 [[package]]
-name = "caml-engine"
-version = "0.1.0"
-dependencies = [
- "caml-protocol",
- "caml-sim",
- "socket2",
-]
+name = "caml-alloc-count"
+version = "0.2.0"
 
 [[package]]
-name = "caml-feed"
-version = "0.1.0"
+name = "caml-bench"
+version = "0.2.0"
 dependencies = [
+ "caml-engine",
  "caml-protocol",
  "caml-sim",
  "clap",
 ]
 
 [[package]]
+name = "caml-engine"
+version = "0.2.0"
+dependencies = [
+ "caml-alloc-count",
+ "caml-protocol",
+ "caml-sim",
+ "nix",
+ "socket2",
+]
+
+[[package]]
+name = "caml-feed"
+version = "0.2.0"
+dependencies = [
+ "caml-protocol",
+ "caml-sim",
+ "clap",
+ "socket2",
+]
+
+[[package]]
+name = "caml-frame"
+version = "0.2.0"
+dependencies = [
+ "caml-sim",
+ "etherparse",
+]
+
+[[package]]
 name = "caml-protocol"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "caml-recv"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "caml-engine",
  "caml-protocol",
@@ -101,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "caml-sim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "caml-protocol",
 ]
@@ -188,6 +225,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherparse"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17304d06addb3283cdc4bd528e42dd95e73c8ee2d6492ffce415e93660885449"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,6 +252,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -215,6 +270,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

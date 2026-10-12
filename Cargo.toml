@@ -3,21 +3,29 @@ resolver = "3"
 members = [
     "crates/protocol",
     "crates/engine",
+    "crates/frame",
     "crates/sim",
+    "crates/alloc-count",
     "apps/receiver",
     "apps/feed-generator",
+    "apps/bench",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+# Oldest toolchain the workspace builds with (slice::as_chunks and let-chains
+# need 1.88). CI checks this; `rust-toolchain.toml` pins the dev toolchain.
+rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
 caml-protocol = { path = "crates/protocol" }
 caml-engine = { path = "crates/engine" }
+caml-frame = { path = "crates/frame" }
 caml-sim = { path = "crates/sim" }
-socket2 = "0.6.5"
+caml-alloc-count = { path = "crates/alloc-count" }
+socket2 = { version = "0.6.5", features = ["all"] }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
 
@@ -27,3 +35,9 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 unwrap_used = "warn"
 expect_used = "warn"
+
+[profile.release]
+# One codegen unit and fat LTO: slower builds, but the numbers in
+# docs/benchmarks.md are measured with exactly this profile.
+codegen-units = 1
+lto = "fat"

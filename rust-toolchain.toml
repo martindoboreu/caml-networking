@@ -1,0 +1,7 @@
+# Development and CI toolchain. Benchmarks in docs/benchmarks.md record the
+# compiler they were built with; bump this deliberately, not implicitly.
+# The minimum supported version is `rust-version` in Cargo.toml (checked in CI).
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

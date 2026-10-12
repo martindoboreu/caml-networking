@@ -5,20 +5,20 @@
 
 use caml_protocol::*;
 
-const GOLDEN_SESSION: u32 = 0x0102_0304;
+const GOLDEN_EPOCH: u64 = 0x0102_0304_0506_0708;
 const GOLDEN_SEND_TIME: u64 = 0x1122_3344_5566_7788;
 
 #[rustfmt::skip]
 const GOLDEN_PACKET: [u8; 72] = [
     // ---- packet header (32 bytes) ----
     0x43, 0x4D,                                     // magic "CM"
-    0x01,                                           // version
+    0x02,                                           // version 2
     0x00,                                           // flags
-    0x04, 0x03, 0x02, 0x01,                         // session_id
-    0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // packet_seq = 5
-    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // send_time_ns
     0x01, 0x00,                                     // msg_count = 1
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,             // reserved
+    0x00, 0x00,                                     // reserved
+    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // session_epoch
+    0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // first_seq = 9
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // send_time_ns
     // ---- message 0 (40 bytes) ----
     0x28, 0x00,                                     // length = 40
     0x01,                                           // type = Trade
@@ -28,6 +28,17 @@ const GOLDEN_PACKET: [u8; 72] = [
     0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // event_time_ns = 1000
     0x00, 0x94, 0x35, 0x77, 0x00, 0x00, 0x00, 0x00, // price = 2.0 (2e9 units)
     0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // quantity = 300
+];
+
+#[rustfmt::skip]
+const GOLDEN_END_OF_SESSION: [u8; 32] = [
+    0x43, 0x4D, 0x02,
+    0x01,                                           // flags = END_OF_SESSION
+    0x00, 0x00,                                     // msg_count = 0
+    0x00, 0x00,
+    0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // session_epoch
+    0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // first_seq = next seq = 10
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
 ];
 
 fn golden_event() -> MarketEvent {
@@ -46,15 +57,16 @@ fn event(seq: u64) -> MarketEvent {
         msg_type: MessageType::BidUpdate,
         instrument_id: 7,
         seq,
-        event_time_ns: 1_700_000_000_000_000_000 + seq,
+        event_time_ns: 1_700_000_000_000_000_000u64.wrapping_add(seq),
         price: Price::from_raw(-5 * PRICE_SCALE / 4),
         quantity: u64::MAX - seq,
     }
 }
 
-fn encode(session: u32, packet_seq: u64, events: &[MarketEvent]) -> Vec<u8> {
+fn encode(epoch: u64, events: &[MarketEvent]) -> Vec<u8> {
+    let first = events.first().map_or(1, |e| e.seq);
     let mut buf = vec![0u8; packet_len(events.len() as u16)];
-    let mut w = PacketWriter::new(&mut buf, session, packet_seq).unwrap();
+    let mut w = PacketWriter::new(&mut buf, epoch, first).unwrap();
     for e in events {
         w.push(e).unwrap();
     }
@@ -65,7 +77,7 @@ fn encode(session: u32, packet_seq: u64, events: &[MarketEvent]) -> Vec<u8> {
 
 #[test]
 fn encoder_produces_golden_bytes() {
-    let bytes = encode(GOLDEN_SESSION, 5, &[golden_event()]);
+    let bytes = encode(GOLDEN_EPOCH, &[golden_event()]);
     assert_eq!(bytes, GOLDEN_PACKET);
 }
 
@@ -75,48 +87,96 @@ fn decoder_reads_golden_bytes() {
     assert_eq!(
         *view.header(),
         PacketHeader {
-            session_id: GOLDEN_SESSION,
-            packet_seq: 5,
+            session_epoch: GOLDEN_EPOCH,
+            first_seq: 9,
             send_time_ns: GOLDEN_SEND_TIME,
             msg_count: 1,
+            end_of_session: false,
         }
     );
+    assert_eq!(view.header().end_seq(), 10);
     let msgs: Vec<_> = view.messages().collect();
     assert_eq!(msgs, vec![golden_event()]);
+}
+
+#[test]
+fn end_of_session_golden_bytes() {
+    let mut buf = [0u8; PACKET_HEADER_LEN];
+    let len = write_heartbeat(&mut buf, GOLDEN_EPOCH, 10, true, GOLDEN_SEND_TIME).unwrap();
+    assert_eq!(&buf[..len], &GOLDEN_END_OF_SESSION);
+
+    let view = parse_packet(&GOLDEN_END_OF_SESSION).unwrap();
+    let h = view.header();
+    assert!(h.is_heartbeat() && h.end_of_session);
+    assert_eq!((h.first_seq, h.end_seq()), (10, 10));
 }
 
 #[test]
 fn round_trip_full_mtu_packet() {
     let n = max_messages_for_payload(MAX_PAYLOAD_1500_MTU) as u64;
     let events: Vec<_> = (100..100 + n).map(event).collect();
-    let bytes = encode(1, u64::MAX, &events);
+    let bytes = encode(u64::MAX, &events);
     assert!(bytes.len() <= MAX_PAYLOAD_1500_MTU);
 
     let view = parse_packet(&bytes).unwrap();
-    assert_eq!(view.header().packet_seq, u64::MAX);
+    assert_eq!(view.header().session_epoch, u64::MAX);
+    assert_eq!(view.header().end_seq(), 100 + n);
     assert_eq!(view.messages().len(), events.len());
     assert!(view.messages().eq(events.iter().copied()));
 }
 
 #[test]
-fn heartbeat_packet_has_no_messages() {
-    let bytes = encode(1, 2, &[]);
-    assert_eq!(bytes.len(), PACKET_HEADER_LEN);
-    let view = parse_packet(&bytes).unwrap();
-    assert_eq!(view.header().msg_count, 0);
+fn heartbeat_carries_next_seq() {
+    let mut buf = [0u8; PACKET_HEADER_LEN];
+    let len = write_heartbeat(&mut buf, 1, 42, false, 5).unwrap();
+    assert_eq!(len, PACKET_HEADER_LEN);
+    let view = parse_packet(&buf).unwrap();
+    let h = view.header();
+    assert_eq!((h.msg_count, h.first_seq, h.end_seq()), (0, 42, 42));
+    assert!(!h.end_of_session);
     assert_eq!(view.messages().count(), 0);
 }
 
 #[test]
-fn writer_rejects_overflowing_buffer() {
+fn patch_send_time_rewrites_only_the_timestamp() {
+    let mut bytes = GOLDEN_PACKET.to_vec();
+    patch_send_time(&mut bytes, 77).unwrap();
+    let view = parse_packet(&bytes).unwrap();
+    assert_eq!(view.header().send_time_ns, 77);
+    assert_eq!(bytes[..24], GOLDEN_PACKET[..24]);
+    assert_eq!(bytes[32..], GOLDEN_PACKET[32..]);
+    assert!(matches!(
+        patch_send_time(&mut [0u8; 31], 1),
+        Err(EncodeError::BufferFull { .. })
+    ));
+}
+
+#[test]
+fn writer_rejects_bad_input() {
     let mut small = [0u8; PACKET_HEADER_LEN - 1];
     assert!(matches!(
-        PacketWriter::new(&mut small, 0, 0),
+        PacketWriter::new(&mut small, 1, 1),
         Err(EncodeError::BufferFull { .. })
     ));
 
     let mut buf = [0u8; PACKET_HEADER_LEN + MESSAGE_LEN + 10];
-    let mut w = PacketWriter::new(&mut buf, 0, 0).unwrap();
+    assert_eq!(
+        PacketWriter::new(&mut buf, 0, 1).unwrap_err(),
+        EncodeError::ZeroSessionEpoch
+    );
+    assert_eq!(
+        PacketWriter::new(&mut buf, 1, 0).unwrap_err(),
+        EncodeError::InvalidSeq
+    );
+
+    let mut w = PacketWriter::new(&mut buf, 1, 1).unwrap();
+    assert_eq!(
+        w.push(&event(2)),
+        Err(EncodeError::SeqMismatch {
+            expected: 1,
+            found: 2
+        })
+    );
     w.push(&event(1)).unwrap();
     assert_eq!(
         w.push(&event(2)),
@@ -126,6 +186,18 @@ fn writer_rejects_overflowing_buffer() {
         })
     );
     assert_eq!(w.msg_count(), 1);
+    assert_eq!(w.next_seq(), 2);
+
+    // A packet whose end sequence would overflow u64 is rejected.
+    let mut buf = [0u8; PACKET_HEADER_LEN + MESSAGE_LEN];
+    let mut w = PacketWriter::new(&mut buf, 1, u64::MAX).unwrap();
+    assert_eq!(w.push(&event(u64::MAX)), Err(EncodeError::InvalidSeq));
+
+    let mut hb = [0u8; PACKET_HEADER_LEN];
+    assert_eq!(
+        write_heartbeat(&mut hb, 1, 0, false, 0).unwrap_err(),
+        EncodeError::InvalidSeq
+    );
 }
 
 fn golden_with(f: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
@@ -147,11 +219,39 @@ fn rejects_each_malformation() {
             DecodeError::BadMagic { found: *b"XM" },
         ),
         (
-            golden_with(|b| b[2] = 2),
-            DecodeError::UnsupportedVersion { found: 2 },
+            golden_with(|b| b[2] = 1),
+            DecodeError::UnsupportedVersion { found: 1 },
         ),
-        (golden_with(|b| b[3] = 1), DecodeError::ReservedNonZero),
-        (golden_with(|b| b[31] = 1), DecodeError::ReservedNonZero),
+        (
+            golden_with(|b| b[3] = 0x02),
+            DecodeError::InvalidFlags { flags: 0x02 },
+        ),
+        // END_OF_SESSION is only valid on a heartbeat.
+        (
+            golden_with(|b| b[3] = FLAG_END_OF_SESSION),
+            DecodeError::InvalidFlags {
+                flags: FLAG_END_OF_SESSION,
+            },
+        ),
+        (golden_with(|b| b[7] = 1), DecodeError::ReservedNonZero),
+        (
+            golden_with(|b| b[8..16].fill(0)),
+            DecodeError::ZeroSessionEpoch,
+        ),
+        (
+            golden_with(|b| b[16..24].fill(0)),
+            DecodeError::InvalidSeqRange {
+                first_seq: 0,
+                msg_count: 1,
+            },
+        ),
+        (
+            golden_with(|b| b[16..24].fill(0xFF)),
+            DecodeError::InvalidSeqRange {
+                first_seq: u64::MAX,
+                msg_count: 1,
+            },
+        ),
         (
             golden_with(|b| b.truncate(71)),
             DecodeError::LengthMismatch {
@@ -167,7 +267,7 @@ fn rejects_each_malformation() {
             },
         ),
         (
-            golden_with(|b| b[24] = 2),
+            golden_with(|b| b[4] = 2),
             DecodeError::LengthMismatch {
                 expected: 112,
                 actual: 72,
@@ -191,6 +291,14 @@ fn rejects_each_malformation() {
             golden_with(|b| b[35] = 0x80),
             DecodeError::MessageFlagsNonZero { index: 0 },
         ),
+        (
+            golden_with(|b| b[40] = 8),
+            DecodeError::MessageSeqMismatch {
+                index: 0,
+                expected: 9,
+                found: 8,
+            },
+        ),
     ];
     for (bytes, expected) in cases {
         assert_eq!(parse_packet(&bytes).unwrap_err(), expected, "{expected}");
@@ -199,7 +307,7 @@ fn rejects_each_malformation() {
 
 #[test]
 fn bad_later_message_rejects_whole_packet() {
-    let mut bytes = encode(1, 1, &[event(1), event(2), event(3)]);
+    let mut bytes = encode(1, &[event(1), event(2), event(3)]);
     let third_type = PACKET_HEADER_LEN + 2 * MESSAGE_LEN + 2;
     bytes[third_type] = 99;
     assert_eq!(
@@ -207,6 +315,18 @@ fn bad_later_message_rejects_whole_packet() {
         DecodeError::UnknownMessageType {
             index: 2,
             msg_type: 99
+        }
+    );
+
+    let mut bytes = encode(1, &[event(1), event(2), event(3)]);
+    let third_seq = PACKET_HEADER_LEN + 2 * MESSAGE_LEN + 8;
+    bytes[third_seq] = 4;
+    assert_eq!(
+        parse_packet(&bytes).unwrap_err(),
+        DecodeError::MessageSeqMismatch {
+            index: 2,
+            expected: 3,
+            found: 4
         }
     );
 }
@@ -223,8 +343,9 @@ fn splitmix(state: &mut u64) -> u64 {
 #[test]
 fn arbitrary_bytes_never_panic() {
     let mut rng = 0xC0FFEE;
-    let valid = encode(9, 9, &[event(1), event(2), event(3), event(4)]);
-    for _ in 0..50_000 {
+    let valid = encode(9, &[event(1), event(2), event(3), event(4)]);
+    let mut accepted = 0;
+    for _ in 0..200_000 {
         // Half random garbage, half single/multi-byte corruptions of a valid
         // packet (which exercise the deeper validation paths).
         let bytes = if splitmix(&mut rng).is_multiple_of(2) {
@@ -239,10 +360,17 @@ fn arbitrary_bytes_never_panic() {
             b
         };
         if let Ok(view) = parse_packet(&bytes) {
-            assert_eq!(
-                view.messages().count(),
-                usize::from(view.header().msg_count)
-            );
+            accepted += 1;
+            let h = view.header();
+            assert_eq!(view.messages().count(), usize::from(h.msg_count));
+            assert!(h.session_epoch != 0 && h.first_seq != 0);
+            // Every accepted packet satisfies the sequencing invariant.
+            for (i, m) in view.messages().enumerate() {
+                assert_eq!(m.seq, h.first_seq + i as u64);
+            }
         }
     }
+    // Corruptions of non-validated fields (prices, times) are accepted, so
+    // the deep paths really were exercised.
+    assert!(accepted > 1_000, "accepted={accepted}");
 }

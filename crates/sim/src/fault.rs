@@ -91,12 +91,13 @@ impl FaultInjector {
     }
 
     /// Processes packet number `index` (1-based), calling `send` zero or more
-    /// times. `packet` may be modified in place.
+    /// times. `packet` may be modified in place, and `send` may modify the
+    /// bytes it is given (e.g. to stamp the send time just before sending).
     pub fn process<E>(
         &mut self,
         index: u64,
         packet: &mut [u8],
-        mut send: impl FnMut(&[u8]) -> Result<(), E>,
+        mut send: impl FnMut(&mut [u8]) -> Result<(), E>,
     ) -> Result<(), E> {
         match self.plan.fault_for(index) {
             Some(Fault::Drop) => {
@@ -129,14 +130,14 @@ impl FaultInjector {
 
     /// Sends any packet still held for reordering. Call once after the last
     /// packet.
-    pub fn finish<E>(&mut self, mut send: impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+    pub fn finish<E>(&mut self, mut send: impl FnMut(&mut [u8]) -> Result<(), E>) -> Result<(), E> {
         self.flush(&mut send)
     }
 
-    fn flush<E>(&mut self, send: &mut impl FnMut(&[u8]) -> Result<(), E>) -> Result<(), E> {
+    fn flush<E>(&mut self, send: &mut impl FnMut(&mut [u8]) -> Result<(), E>) -> Result<(), E> {
         if self.holding {
             self.holding = false;
-            send(&self.held)?;
+            send(&mut self.held)?;
         }
         Ok(())
     }

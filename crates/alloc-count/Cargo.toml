@@ -1,0 +1,20 @@
+[package]
+name = "caml-alloc-count"
+description = "Test-only counting global allocator used to prove the receive path never allocates."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# This crate opts out of the workspace's `unsafe_code = "forbid"` because
+# implementing `GlobalAlloc` requires `unsafe impl`. It is a dev-dependency
+# only and never linked into a production binary. Every unsafe block carries
+# a SAFETY comment (enforced below).
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "warn"
+expect_used = "warn"

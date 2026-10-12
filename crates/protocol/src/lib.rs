@@ -1,4 +1,4 @@
-//! CAML market-data wire protocol, version 1.
+//! CAML market-data wire protocol, version 2.
 //!
 //! This crate defines the binary format exchanged between the synthetic feed
 //! generator and the receiver. It performs no I/O and has no dependencies so
@@ -9,6 +9,11 @@
 //!
 //! * One UDP datagram carries one [packet](PacketHeader): a 32-byte header
 //!   followed by `msg_count` fixed-size 40-byte messages.
+//! * Sequencing follows the MoldUDP64 model: the header carries the sequence
+//!   number of its first message, messages are contiguous, and a heartbeat
+//!   (zero messages) carries the next sequence number the publisher will use.
+//! * A publisher run is identified by a non-zero, monotonically increasing
+//!   `session_epoch`.
 //! * All integers are little-endian.
 //! * Prices are signed fixed-point integers with [`PRICE_SCALE`] units per 1.0.
 //!
@@ -25,14 +30,17 @@ mod layout;
 use std::fmt;
 
 pub use decode::{Messages, PacketView, parse_packet};
-pub use encode::PacketWriter;
+pub use encode::{PacketWriter, patch_send_time, write_heartbeat};
 pub use error::{DecodeError, DecodeErrorKind, EncodeError};
 
 /// First two bytes of every packet: ASCII `"CM"`.
 pub const MAGIC: [u8; 2] = *b"CM";
 
 /// Protocol version implemented by this crate.
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
+
+/// Header flag: this heartbeat is the last packet of its session.
+pub const FLAG_END_OF_SESSION: u8 = 0x01;
 
 /// Size of the packet header in bytes.
 pub const PACKET_HEADER_LEN: usize = 32;
@@ -121,16 +129,36 @@ impl fmt::Display for Price {
 /// Decoded packet header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PacketHeader {
-    /// Identifies one run of a feed publisher. A change means sequence numbers
-    /// have restarted and receivers must reset their sequence state.
-    pub session_id: u32,
-    /// Per-session packet sequence number, incremented by one per datagram.
-    pub packet_seq: u64,
+    /// Identifies one run of a feed publisher: its start time in nanoseconds
+    /// since the Unix epoch. Never zero. A restarted publisher uses a strictly
+    /// larger value, so receivers can tell a new session from a stale one.
+    pub session_epoch: u64,
+    /// For a data packet, the sequence number of its first message. For a
+    /// heartbeat, the sequence number the publisher's next message will carry.
+    /// Sequence numbers start at 1 in every session.
+    pub first_seq: u64,
     /// Publisher wall-clock time just before transmission, in nanoseconds
     /// since the Unix epoch.
     pub send_time_ns: u64,
     /// Number of messages following the header. Zero denotes a heartbeat.
     pub msg_count: u16,
+    /// Set on the final heartbeat of a session.
+    pub end_of_session: bool,
+}
+
+impl PacketHeader {
+    /// One past the last sequence number covered by this packet: the
+    /// sequence number the publisher will use next.
+    ///
+    /// The decoder guarantees `first_seq + msg_count` fits in `u64`.
+    pub const fn end_seq(&self) -> u64 {
+        self.first_seq.saturating_add(self.msg_count as u64)
+    }
+
+    /// Whether this packet is a heartbeat (carries no messages).
+    pub const fn is_heartbeat(&self) -> bool {
+        self.msg_count == 0
+    }
 }
 
 /// One decoded market-data message.
