@@ -7,6 +7,10 @@ understand why the code looks the way it does.
 
 ## Milestone 1: Synthetic feed → validated, measured receiver (Stages 0–2)
 
+> This entry describes protocol **v1** as originally built (packet sequence
+> plus message sequence, 32-bit session id). Milestone 2 below explains why
+> v2 replaced it.
+
 ### What we built
 
 A publisher (`caml-feed`) encodes a random-walk market into a versioned binary
@@ -152,6 +156,13 @@ warmup exclusion, and recording run conditions. Processing time, about 100 ns
 per packet including three clock reads, is far below the network-path
 latency. The current bottleneck is the OS path, not our parsing.
 
+> **Correction (2026-10-09 audit).** The 8.1 ms p99 / 20.2 ms max in the
+> clean run did **not** reproduce: 14 later runs of the same scenario gave
+> p99 of 25–35 µs (`docs/benchmarks.md`). Its cause is unknown. "About 100 ns
+> per packet" was the 100 ns resolution of `Instant` on Windows, not a
+> measurement; batch timing gives 106 ns with instrumentation, of which
+> 13.5 ns is parsing and sequencing. Treat single runs as anecdotes.
+
 ### Check your understanding
 
 1. `FeedProcessor::process_packet` takes `bytes: &[u8]`. Why can't it return
@@ -269,3 +280,99 @@ struct instead of through a shim call each.
 5. Our `UdpSource` takes a fresh `RxMeta::now()` per datagram, but the DPDK
    design takes one per burst. Why is the per-burst stamp *not* less accurate
    for DPDK? What does a per-packet stamp inside a burst actually measure?
+
+---
+
+## Milestone 2: integrity hardening, protocol v2, Linux groundwork
+
+### Why this milestone happened
+
+An independent audit wrote small adversarial tests against milestone 1 and
+found that the receiver could be fooled in ways the original tests never
+tried. All of these were reproduced before anything was fixed:
+
+* One stray packet from another "session" reset all sequence state, so
+  A → B → A delivered A's message twice.
+* Reordering at session start (packet 2 before packet 1) dropped packet 1 as
+  a "duplicate", and the loss was not counted anywhere.
+* Four valid packets with huge sequence numbers crashed a debug build
+  (`attempt to add with overflow`) and corrupted counters in release.
+* One packet far in the future made every later message look "late".
+* Loss followed by a publisher restart printed no warning.
+
+The lesson: **tests that only exercise cooperative inputs prove very
+little.** The new suite feeds the receiver hostile streams on purpose.
+
+### What changed and why
+
+**Protocol v2 copies a proven design (MoldUDP64).** One sequence space per
+session, starting at 1. The header says which sequence number the packet
+starts at; heartbeats say which number comes next. That one idea fixes
+three problems at once:
+
+1. *Tail loss.* If the last two packets before a quiet period are lost, the
+   next heartbeat says "next is 41" while we expected 33, so the gap is
+   visible. v1 could not see this at all.
+2. *Start-of-session reordering.* Because sequences start at 1, receiving 3
+   first means 1–2 are *missing* (and may arrive late), not "older than our
+   baseline".
+3. *Fewer moving parts.* The packet-level sequence (and its separate gap
+   table, which heartbeats filled up) is gone. One tracker decides.
+
+**Sessions are ordered.** `session_epoch` is the publisher's start time in
+nanoseconds, so a restart always has a larger epoch. The receiver moves
+forward only when the old session said goodbye (`END_OF_SESSION`), went
+quiet, or the new one has proved itself with three consecutive packets.
+Stale packets from an old run are dropped and counted, never allowed to
+reset state.
+
+**Don't trust a single packet.** A jump of more than 2^20 messages is held
+back until three consecutive packets agree. This is the same idea as the
+session rule: one data point is noise; several consistent ones are a fact.
+
+### Rust concepts in this milestone
+
+**Lints as proofs.** `#![deny(clippy::arithmetic_side_effects)]` on the
+receive-path modules makes the compiler reject any plain `+`/`-` on
+integers there. You must write `saturating_add`, `checked_sub`, and so on,
+so "wire input cannot overflow" is enforced by the build, not by review.
+
+**Counting allocations with a global allocator.** Rust lets a binary replace
+its allocator with `#[global_allocator]`. The test crate `caml-alloc-count`
+wraps the system allocator and counts calls made by the current thread
+(thread-local counters, so parallel tests don't interfere). Implementing
+`GlobalAlloc` requires `unsafe impl`, so this tiny test-only crate is the one
+place `unsafe` is allowed, with a `// SAFETY:` comment on every block that
+the linter enforces.
+
+**`VecDeque` + binary search instead of `Vec::remove(0)` + linear scan.**
+Evicting the oldest gap from a full `Vec` shifts all 1,023 others (16 KiB
+of memmove). A ring buffer pops the front in O(1), and because gaps are
+sorted, `partition_point` finds the right one in about 10 comparisons. The
+benchmark went from 64 ns to 3.3 ns per new gap.
+
+**Safe syscalls through `nix`.** `recvmmsg`, `SO_RXQ_OVFL`, and
+`SO_TIMESTAMPNS` are C APIs, but `nix` wraps them safely and promises no
+allocation in `recvmmsg`, so the engine still has zero `unsafe`. One subtle
+point: `nix` macros expand inside *our* crate, so we checked that
+`cmsg_space!` calls a safe function rather than emitting an `unsafe` block,
+which `forbid(unsafe_code)` would reject.
+
+**Differential testing.** The new Ethernet/IPv4/UDP parser is compared with
+an independent library (`etherparse`) on 100,000 randomly mutated frames.
+The first run found a real difference (a legacy VLAN tag reported as "not
+IPv4"); the second found a deliberate one (a UDP length of 0, which only
+means something for IPv6 jumbograms). Both are now documented in
+`docs/decisions.md`.
+
+### Check your understanding
+
+4. A heartbeat says the next sequence is 50, but we have only seen up to 45.
+   What does the receiver record, and what changes if packets 46–49 then
+   arrives?
+5. Why does the session gate accept an *older* epoch only when the current
+   session is quiet **and** the old one sends three packets in a row? What
+   failure does each half of that condition prevent?
+6. The property test asserts that the generator produced session changes,
+   resyncs, and late deliveries at least once. Why is that assertion as
+   important as the invariants themselves?

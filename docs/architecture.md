@@ -1,51 +1,53 @@
 # CAML Networking Engine: Architecture
 
-Last updated: Stage 0–2 (first milestone), plus the planned DPDK backend
-design (section 9).
+Last updated: 2026-10-09 (milestone 2: integrity hardening, protocol v2,
+Linux batched backend, frame parser, benchmark harness).
+
+Status labels used throughout: **implemented**, **tested** (automated tests
+run on Windows), **CI-only** (tests exist but run only on Linux CI; not yet
+executed), **benchmarked**, **planned**, **blocked**.
 
 ## 1. Scope and system boundary
 
 **In scope:** receiving UDP market-data datagrams, decoding them,
-validating sequence integrity, measuring the receive path, and handing
-normalized events to a consumer inside the same process.
+validating sequence and session integrity, measuring the receive path, and
+handing normalized events to a consumer inside the same process.
 
 **Out of scope (for now):** order entry, broker/exchange connectivity,
-strategy logic, persistence, retransmission/recovery protocols, multicast
-group management, and anything that touches the CAML server (`camlcompute`).
+strategy logic, persistence, retransmission/recovery protocols, and anything
+that touches the CAML server (`camlcompute`) without written authorization.
 
 ```text
-                 ┌──────────────────── caml-recv process ───────────────────┐
- caml-feed ──UDP──▶ PacketSource ──&[u8]──▶ FeedProcessor ──MarketEvent──▶ EventSink
- (publisher)     │  (transport)            parse → sequence → metrics       (consumer)
-                 └───────────────────────────────────────────────────────────┘
+                 ┌──────────────────────── caml-recv process ─────────────────────────┐
+ caml-feed ──UDP──▶ PacketSource ──&[u8], RxMeta──▶ FeedProcessor ──MarketEvent──▶ EventSink
+ (publisher)     │  (transport)                     parse → session gate → sequence   (consumer)
+                 │   TransportStats                  → metrics, Integrity verdict      │
+                 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ## 2. Workspace layout
 
-| Path                  | Crate           | Responsibility | Deps |
-|-----------------------|-----------------|----------------|------|
-| `crates/protocol`     | `caml-protocol` | Wire format: encoder, zero-copy validating decoder. No I/O. | none |
-| `crates/engine`       | `caml-engine`   | Transports, sequence tracking, histogram, metrics, receive loop. | protocol, `socket2` |
-| `crates/sim`          | `caml-sim`      | Deterministic synthetic market and fault injection (drop/corrupt/duplicate/reorder). | protocol |
-| `apps/receiver`       | `caml-recv`     | CLI receiver with periodic and final reports. | engine, `clap`, `ctrlc` |
-| `apps/feed-generator` | `caml-feed`     | CLI publisher with rate pacing and fault flags. | sim, `clap` |
+| Path                  | Crate              | Responsibility | Deps |
+|-----------------------|--------------------|----------------|------|
+| `crates/protocol`     | `caml-protocol`    | Wire format v2: encoder, zero-copy validating decoder. No I/O. | none |
+| `crates/engine`       | `caml-engine`      | Transports (`UdpSource`, Linux `RecvMmsgSource`), session gate, sequencer, histogram, metrics, receive loop. | protocol, `socket2`; Linux: `nix` |
+| `crates/frame`        | `caml-frame`       | Ethernet/802.1Q/IPv4/UDP parsing and filtering for raw-packet backends (AF_XDP, DPDK). No I/O, no deps. | none (dev: `etherparse` as test oracle) |
+| `crates/sim`          | `caml-sim`         | Deterministic synthetic market, fault injection, Ethernet framing + pcap writer. Test tooling. | protocol |
+| `crates/alloc-count`  | `caml-alloc-count` | Test-only counting allocator proving the receive path never allocates. The only crate with `unsafe` (see D10). | none |
+| `apps/receiver`       | `caml-recv`        | CLI receiver: backends, multicast, source allowlist, integrity verdict, exit codes. | engine, `clap`, `ctrlc` |
+| `apps/feed-generator` | `caml-feed`        | CLI publisher: pacing, heartbeats, end-of-session, faults, multicast, pcap output. | sim, `socket2`, `clap` |
+| `apps/bench`          | `caml-bench`       | Reproducible micro and loopback benchmarks. | engine, sim, `clap` |
 
-**Why five crates and not more.** The suggested layout split out `core`,
-`transport-udp`, and `metrics`. At this size those boundaries would be
-module boundaries pretending to be crate boundaries. The two splits that do
-pay for themselves are:
+**Why these crates and not more.** `protocol` and `frame` are contracts
+shared by several backends and tools (and, later, an FPGA reference model),
+so they stay dependency-free and I/O-free. `sim` and `alloc-count` are test
+tooling and never linked into production binaries. Everything else is a
+module of `engine` until a real reason appears.
 
-* `protocol` is the contract shared by the publisher, the receiver, tests,
-  and eventually an FPGA reference model. It must stay dependency-free and
-  I/O-free.
-* `sim` is test tooling. Keeping it out of `engine` means production builds
-  never contain fault-injection code.
-
-Linux-specific transports will be modules in `engine` behind
-`#[cfg(target_os = "linux")]`. AF_XDP, which needs `libbpf`/`libxdp` and
-`unsafe`, will be its own feature-gated crate so the `unsafe_code = "forbid"`
-lint stays in force everywhere else. The same goes for the planned DPDK
-backend (section 9).
+The **planned** AF_XDP backend will be its own crate (`caml-transport-xdp`),
+the second crate allowed to contain `unsafe`, with a `// SAFETY:` comment on
+every block (enforced by `clippy::undocumented_unsafe_blocks`). `caml-engine`
+will not depend on it.
 
 ## 3. Key interfaces
 
@@ -53,219 +55,206 @@ backend (section 9).
 // Transport: lends each datagram to a callback; the slice cannot escape.
 trait PacketSource {
     fn poll<F: FnMut(&[u8], RxMeta)>(&mut self, on_packet: F) -> io::Result<usize>;
+    fn stats(&self) -> TransportStats; // every drop below the protocol layer
 }
 
-// Consumer boundary: duplicates are never delivered; everything else is
-// delivered exactly once with its ordering status.
+struct RxMeta { rx_wall_ns: u64, rx_instant: Instant, rx_kernel_ns: Option<u64> } // non_exhaustive
+
+// Consumer boundary: within a session every seq is delivered at most once,
+// tagged InOrder | AfterGap | Late. Nothing is dropped without a counter.
 trait EventSink {
-    fn on_event(&mut self, event: &MarketEvent, delivery: Delivery); // InOrder | AfterGap | Late
+    fn on_event(&mut self, event: &MarketEvent, delivery: Delivery);
 }
 ```
 
-The **lending** design of `PacketSource` was chosen over "fill my buffer"
-(`recv(&mut [u8])`) because it fits every backend we plan to evaluate without
-forcing a copy:
+The **lending** design of `PacketSource` fits every backend without forcing a
+copy:
 
-| Backend | How it implements `poll` |
-|---|---|
-| `UdpSource` (now) | `recv_from` into an owned 64 KiB buffer, lend `&buf[..n]` |
-| `recvmmsg` (Phase B) | one syscall fills N buffers, lend each in turn |
-| AF_XDP (Phase C) | lend a UMEM frame slice, return the frame to the fill ring after the callback |
-| DPDK (planned, section 9) | lend each mbuf's UDP payload in wire order, bulk-free the burst after the last callback |
+| Backend | How it implements `poll` | Status |
+|---|---|---|
+| `UdpSource` | `recv_from` into an owned 64 KiB buffer, lend `&buf[..n]` | implemented, tested |
+| `RecvMmsgSource` (Linux) | one `recvmmsg` fills 32 slots; lend each; per-datagram kernel timestamp; kernel drop counter | implemented; **CI-only** (compiles for Linux, never executed here) |
+| AF_XDP | lend a UMEM frame's UDP payload (via `caml-frame`), recycle to the fill ring after the callback | planned |
+| DPDK | lend each mbuf's UDP payload in wire order, bulk-free the burst | design only; not on the I219 (D8) |
 
 Generic (`F: FnMut`) rather than `&mut dyn FnMut` so the per-packet call is
 monomorphized and inlined into the receive loop.
 
-`RxMeta` is `#[non_exhaustive]` and built with `RxMeta::now()`, so fields
-such as a NIC hardware timestamp can be added later without breaking
-backends in other crates. Batched backends capture one `RxMeta` per batch.
-
 ## 4. Concurrency model
 
-**Milestone 1: one thread does everything.** The receive loop calls `poll`,
-the processor parses and validates inline, and the sink runs inline.
+**One thread does everything** (implemented): `run` calls `poll`, the
+processor parses, gates, sequences and accounts inline, and the sink runs
+inline. This is the latency floor (no queue hop, no cross-core transfer) and
+trivially correct (no shared mutable state; the only atomic is the stop flag,
+`Relaxed`, because it publishes no data).
 
-Rationale:
+**When this changes:** when a consumer's per-event cost risks socket-buffer
+overflow, now directly observable as `TransportStats::kernel_drops` on Linux.
+The planned step is a bounded SPSC ring of indices between a pinned receive
+thread and a consumer thread, with overflow counted. It will be introduced
+with before/after measurements on Linux, not speculatively.
 
-* It is the latency floor: no queue hop, no cross-core cache-line transfer,
-  no wakeup.
-* It is trivially correct: no shared mutable state, no atomics except the
-  shutdown flag.
-* We have no measurement yet showing the consumer is slow enough to need
-  decoupling.
+**Async/Tokio is not used on the hot path** (D11).
 
-**When this changes:** when a consumer's per-event cost risks the socket
-buffer overflowing (detectable as kernel drops and packet-seq gaps under
-load). The planned next step is a bounded SPSC ring between a receive thread
-(pinned, possibly busy-polling) and a consumer thread, with explicit overflow
-accounting. That will be introduced with before/after measurements, not
-speculatively.
-
-**Async/Tokio is not used on the hot path.** An async runtime solves
-"thousands of mostly idle connections". We have one socket that is either
-busy or idle. A dedicated thread with a blocking or busy-polled socket has
-fewer layers between the NIC and our code. Tokio may still be appropriate
-later for control-plane work such as config reload or metrics export.
-
-**Shutdown:** an `AtomicBool` checked between polls. The socket read timeout
-(default 100 ms) bounds shutdown latency. `Ordering::Relaxed` is sufficient
-because the flag publishes no other data.
+**Shutdown:** the stop flag is checked between polls; the poll timeout
+(default 100 ms) bounds shutdown latency.
 
 ## 5. Memory and buffer ownership
 
 | Object | Owner | Allocation |
 |---|---|---|
-| Receive buffer (64 KiB) | `UdpSource` | once, at bind |
-| `PacketView<'a>` | borrows the receive buffer | none (stack) |
-| `MarketEvent` (40 B, `Copy`) | stack, passed by reference to sink | none |
-| Sequence gap tables | `SequenceTracker` | once, pre-sized `Vec` |
-| Latency histograms (15 KiB each) | `FeedProcessor` | once, boxed |
+| Receive buffer (64 KiB) / 32 × 2 KiB slots + mmsghdrs | backend | once, at bind |
+| `PacketView<'a>` | borrows the receive buffer | none |
+| `MarketEvent` (40 B, `Copy`) | stack | none |
+| Gap table (`VecDeque`, capacity + 1) | `SequenceTracker` | once |
+| Latency histograms (3 × 15 KiB) | `FeedProcessor` | once, boxed |
 
-**The steady-state receive path performs zero heap allocations.** It is
-enforced by construction and code review, not yet by an automated test; a
-counting global allocator test is planned. A 64 KiB buffer is used even
-though our packets are at most 1472 B, so a datagram can never be truncated
-(Linux truncates silently; Windows returns `WSAEMSGSIZE`). Only the bytes
-actually received are touched, so the cache cost is proportional to packet
-size, not buffer size.
+**The steady-state receive path performs zero heap allocations: tested.**
+`crates/engine/tests/alloc.rs` installs a counting global allocator and
+asserts zero allocations over (a) about 2,400 adversarial datagrams through
+`process_packet` (gaps, late fills, duplicates, heartbeats, implausible
+jumps, malformed and foreign-session datagrams, end of session, session
+change) and (b) the full `run` loop over a real UDP socket.
 
 ## 6. Reliability semantics
+
+### Session gate (implemented, tested)
+
+| Situation | Behavior | Counter |
+|---|---|---|
+| First valid packet | adopt its epoch | — |
+| Same epoch | process | — |
+| Epoch > receiver clock + 300 s | drop | `implausible_epoch_packets` |
+| Newer epoch, current session ended (EOS) or silent ≥ 500 ms | adopt at once | `session_changes` (+ `unterminated_sessions` if no EOS was seen) |
+| Newer epoch, current session active | drop until 3 consecutive packets confirm it | `unconfirmed_session_packets` |
+| Older epoch, current session active | drop | `stale_session_packets` |
+| Older epoch, current silent ≥ 500 ms **and** 3 consecutive packets | adopt (un-sticks a receiver that latched onto a stray packet) | `session_changes` |
+
+On a session change, outstanding gaps of the old session are counted as
+`abandoned` (lost), never silently forgotten.
+
+### Sequencer (implemented, tested)
 
 | Condition | Detection | Effect |
 |---|---|---|
 | Malformed datagram | `parse_packet` error | counted by kind; whole datagram dropped |
-| Lost packet | packet-seq gap | counted (`missing`, `outstanding`) |
-| Reordered packet | arrives inside a tracked gap | delivered with `Delivery::Late`; gap shrinks |
-| Duplicate packet | packet seq behind and not in a gap | counted, **not** delivered |
-| Publisher restart | `session_id` change | sequence state reset, counted |
-| Gap table full | > 1024 outstanding gaps | oldest gap evicted and counted as lost |
+| Lost messages | forward gap (message or heartbeat) | counted `missing`, tracked for late recovery |
+| Tail loss before idle/end | heartbeat / EOS announces next seq | counted as a gap (v1 could not detect this) |
+| Reordered packet | inside a tracked gap | delivered `Late`; gap shrinks |
+| Reordering at session start | seqs start at 1, so early packets are gaps, not "duplicates" | delivered `Late` |
+| Duplicate | behind, not in a gap | counted, not delivered |
+| Jump > `max_forward_jump` (2^20) | implausible | packet dropped and counted; state untouched unless 3 consecutive consistent packets confirm (`resyncs`) |
+| Late join (first seq > `join_window` + 1) | baseline = first seq | `missed_before_join` (informational); earlier seqs → `before_baseline` |
+| Gap table full (1024) | oldest gap evicted | counted lost (`evicted`) |
 | Clock skew | `send_time > rx_time` | counted; excluded from latency |
-| Tail loss | — | **undetectable** without a later packet; publisher sends trailing heartbeats |
-| Kernel socket-buffer overflow | indirect: packet-seq gaps | OS drop counters not yet read (Linux: `/proc/net/udp`, `SO_RXQ_OVFL`) |
+| Kernel socket-buffer overflow | Linux: `SO_RXQ_OVFL` | `TransportStats::kernel_drops` (CI-only) |
+| Datagram > slot (Linux backend) | `MSG_TRUNC` | `TransportStats::truncated` |
+| Source not allowed | `allowed_sources` | `TransportStats::filtered_source` |
 
-Accounting invariant, enforced by tests:
-`missing_total == outstanding + recovered + evicted`.
+All arithmetic on wire values is checked or saturating, enforced with
+`#![deny(clippy::arithmetic_side_effects)]` in `sequence.rs` and
+`pipeline.rs`. Accounting invariant, checked after **every** datagram by the
+property test: `missing_total == outstanding + recovered + evicted + abandoned`.
+
+### Integrity verdict
+
+`Snapshot::integrity()` reports lost messages (`outstanding + evicted +
+abandoned`), malformed, implausible, and rejected-session packets,
+`before_baseline`, and whether the session ended cleanly. `caml-recv` prints
+it and, with `--fail-on-loss`, exits with status 2 on any proven problem.
+Sessions replaced without an end-of-session heartbeat produce a warning:
+their tail loss cannot be proven or ruled out.
 
 ## 7. Timestamps and what latency means here
 
-* **wire latency** = receiver wall clock right after `recv_from` returns,
-  minus the publisher's `send_time_ns`. Valid only when both processes share
-  a clock, i.e. the same host. It includes the publisher's send syscall, the
-  kernel loopback path, socket-buffer queueing, receiver wakeup, and the
-  receive syscall.
-* **processing latency** = monotonic `Instant` from just after receive to
-  after the sink returns: parse, sequencing, metrics, and consumer.
-* On Windows both clocks have 100 ns resolution, so values below about 1 µs
-  are quantized. Each packet costs about three clock reads of instrumentation
-  overhead, which is included in what we measure.
+* **send_to_rx** = receiver wall clock right after the receive call returns,
+  minus the publisher's `send_time_ns` (stamped immediately before `send`).
+  Valid only when both clocks agree (same host, or PTP-synchronized hosts).
+  Includes the sender's syscall, the network or loopback path, socket-buffer
+  queueing, and receiver wakeup. Not a NIC-to-NIC number.
+* **kernel_to_rx** (Linux `RecvMmsgSource`) = user-space receive minus the
+  kernel's `SO_TIMESTAMPNS` arrival stamp: socket queueing plus wakeup.
+* **processing** = `Instant` from receive to sink return, sampled 1-in-N
+  (`--processing-sample-every`; each sample is one clock read).
+* Clock costs on the dev box: `Instant::now()` 23 ns, wall clock 24 ns,
+  resolution 100 ns (benchmarked, `docs/benchmarks.md`). With full
+  instrumentation a packet costs **3 clock reads** (two in `RxMeta::now`, one
+  processing sample); `run` adds none (it reuses the receive stamp).
 
 ## 8. Environment and its limits
 
 | Environment | Status | Valid for |
 |---|---|---|
-| Windows 11 (build 26200), Ryzen 7 9800X3D, Rust 1.99.0 `x86_64-pc-windows-gnu` | **in use** | functional tests, portable baseline, loopback measurements |
-| WSL2 Ubuntu | **not installed** (deferred by decision) | Linux APIs (`recvmmsg`, `SO_BUSY_POLL`, affinity), AF_XDP on `veth` |
-| `camlcompute` (Ubuntu 24.04, I219-LM/e1000e) | **untouched; no access by policy** | future deployment and real-NIC measurements |
+| Windows 11 Pro 26200, Ryzen 7 9800X3D, rustc 1.99.0 `x86_64-pc-windows-gnu` | **in use** | functional tests, loopback and in-process measurements |
+| GitHub Actions `ubuntu-24.04` + `windows-latest` | **configured**, not yet run (no remote push) | all tests incl. Linux-only backend and multicast-on-`lo` |
+| WSL2 / Linux VM | **not installed** (owner's decision) | local Linux runs, AF_XDP on `veth` |
+| Target box: Dell OptiPlex (Ultra) 11th-gen i7, 32 GB, Ubuntu 24.04, onboard I219-LM (13) `8086:15fb`, Thunderbolt 4 | **untouched; no access by policy** | deployment, real-NIC measurements |
 
-Loopback numbers measure the OS network stack and scheduler, not a NIC. They
-must never be compared with physical-NIC numbers as if they were equivalent.
+Loopback numbers measure the OS stack and scheduler, not a NIC. They must
+never be compared with physical-NIC numbers as if equivalent.
 
-**AF_XDP outlook, stated up front.** `camlcompute`'s e1000e driver reports no
-native XDP and no zero-copy. AF_XDP there would run in generic (SKB) copy
-mode, where the kernel has already allocated an `sk_buff` and copies the
-frame into UMEM. The expected gain over a tuned `recvmmsg` socket is small
-and could be negative. At 1 Gbps with our packet sizes the conventional path
-is likely sufficient. We will measure before concluding. Real kernel-bypass
-evaluation needs a NIC with native XDP/zero-copy support (e.g. Intel i40e/ice,
-Mellanox mlx5).
+## 9. Kernel bypass: decision and plan
 
-## 9. Kernel-bypass backends (planned)
+**Decision (D7, D8, D9): AF_XDP first, on an external Thunderbolt NIC; no
+DPDK on the I219.** Full hardware plan and purchase requirements:
+[`docs/hardware-plan.md`](hardware-plan.md).
 
-Status: **planned, not implemented.** No DPDK code or dependencies exist in
-the workspace. The source for this section is the
-[rust-dpdk-net review](research/rust-dpdk-net-review.md) (commit `8670af4`).
+Verified facts behind it:
 
-**Decision on `rust-dpdk-net`: learn from it, don't depend on it.** It is a
-TCP/IP-over-DPDK framework (smoltcp plus tokio). Its UDP path copies each
-payload twice, adds async wake-ups, verifies checksums in software, has no
-receive timestamps, never reads NIC drop counters, hands each RX burst over
-newest-first (a spurious reorder for a sequenced feed), and lets a mempool be
-freed while its mbufs are still in use.
+* e1000e (the I219's driver) has **no native XDP** (no `ndo_bpf` in Linux
+  v6.8 `e1000e/netdev.c`), so AF_XDP on the I219 runs only in generic copy
+  mode, which is not kernel bypass.
+* Ubuntu 24.04 ships DPDK 23.11.4, which has **no entry for the I219-LM (13)
+  `0x15FB`**; DPDK v25.11 does (`em_ethdev.c:168`). The em PMD is not
+  validated on I219, has no timestamp offload, and binding the box's only
+  port would take SSH with it.
+* AF_XDP zero-copy exists in Linux v6.8 for i40e, ice, ixgbe, igc and mlx5.
+  The box has a Thunderbolt 4 root port, so an external NIC is possible.
 
-| Reuse (pattern only) | Implement ourselves | Unnecessary for CAML |
-|---|---|---|
-| `build.rs`: pkg-config → bindgen allowlist → `cc`-compiled C shim that re-exports DPDK's `static inline` functions (`rte_eth_rx_burst`, `rte_pktmbuf_*`). MIT, so keep the notice if we copy a file substantially | `caml-transport-dpdk` crate: EAL/port/mempool lifecycle owned by one `DpdkSource` with ordered teardown | smoltcp or any TCP/IP stack |
-| Shape of its `EalBuilder`, `EthDevBuilder`, and `Mbuf` RAII wrappers, as reference | Own Ethernet/802.1Q/IPv4/UDP parser (~150 lines), differentially tested against `etherparse` 0.21.0 with `proptest` 1.11.0 | tokio, async reactor, cross-thread bridge |
-| | Per-reason drop counters, plus NIC `imissed` / `rx_nombuf` / `ierrors` read about once per second | Multi-queue RSS/RETA, shared ARP cache |
-| | pcap replay fixtures (`pcap-file` 2.0.0) for `net_pcap` tests | HTTP/gRPC/QUIC adapters |
+AF_XDP before DPDK because the kernel keeps the interface (SSH, ARP, IGMP
+joins via an ordinary socket), no hugepages or vfio are needed, a
+`bpf_link`-attached XDP program detaches automatically if the process dies,
+and the same code runs in copy mode on `veth` for development and zero-copy
+on a capable NIC in production. DPDK stays design-only
+(`docs/research/rust-dpdk-net-review.md`) until AF_XDP zero-copy measurably
+falls short.
 
-**Design summary:**
-
-* **Isolation:** a Linux-only crate behind an off-by-default `ffi` feature
-  (build deps `bindgen` 0.73.2, `pkg-config` 0.3.34, `cc` 1.7.0). Without the
-  feature it compiles to nothing, so `cargo test --workspace` keeps working
-  on Windows. It has its own lint table (`unsafe_code = "deny"`, allowed only
-  in the FFI modules, with a `// SAFETY:` comment on every block).
-  `caml-engine` never depends on DPDK.
-* **Hot loop:** one pinned EAL lcore. `poll()` busy-polls `rte_eth_rx_burst`
-  with a burst of 32 and processes packets **front to back, in wire order**.
-  It takes one `RxMeta` per burst, lends each UDP payload to the existing
-  callback, and frees the whole burst with one `rte_pktmbuf_free_bulk` from a
-  guard's `Drop`, so a panicking callback can't leak mbufs. It returns
-  `Ok(0)` after a short poll budget so the existing `run` loop's shutdown and
-  report checks still fire.
-* **Fits today's trait:** the `PacketSource` lending callback needs no change.
-  The higher-ranked `FnMut(&[u8], RxMeta)` bound already stops payload slices
-  from outliving the burst.
-* **Planned interface change, deferred:** a transport-level statistics
-  accessor (filter drops by reason, kernel or NIC drops). It will be added
-  together with the first backend that can actually observe such drops,
-  Linux `recvmmsg` with `SO_RXQ_OVFL`, rather than designed now against a
-  single implementation that has nothing to report. The current Windows UDP
-  backend cannot read kernel drop counts.
-* **Testing without hardware:** in a Linux VM, use the `net_pcap` (replaying
-  `caml-sim` captures), `net_ring`, `net_tap`, `net_af_packet`, and `net_null`
-  virtual devices. These validate **correctness only**; none of them shows
-  kernel-bypass performance.
-
-**Hardware: correcting a common assumption.** DPDK v25.11's e1000 (`em`) PMD
-**does** list I219-LM/V device IDs (`em_ethdev.c:112-190`). However, DPDK
-documents validation only on emulated e1000 devices; the PMD offers at most 2
-queues and no RSS or timestamp offload; and the link is 1 GbE. Binding
-`camlcompute`'s only port to `vfio-pci` would most likely remove it, and SSH
-with it, from Linux. **Conclusion: don't pursue DPDK for performance until a
-supported NIC (Intel X710/E810, NVIDIA ConnectX) is available,** and only
-after the kernel-socket baseline shows the kernel path is the bottleneck.
+Raw-packet groundwork that is **implemented and tested** now:
+`caml-frame` (Ethernet/VLAN/IPv4/UDP parse + filter + per-reason counters,
+differentially tested against `etherparse` on 100,000 mutated frames) and
+`caml-sim::pcap` + `caml-feed --pcap-out` (Ethernet-framed captures for
+`tcpreplay` onto `veth` or DPDK `net_pcap`).
 
 ## 10. Testing strategy
 
-* **Protocol:** a golden byte fixture pins the layout, plus every rejection
-  path and 50,000 deterministic random/corrupted inputs to prove the decoder
-  never panics.
-* **Sequencing:** unit tests for each outcome, gap splitting, eviction,
-  saturation, and a randomized accounting-invariant test.
-* **Pipeline:** byte-level tests (no sockets) for duplicates, reordering,
-  heartbeats, session changes, and clock anomalies.
-* **End to end:** real UDP sockets on 127.0.0.1 with a deterministic fault
-  schedule whose expected counters are derived by hand in the test.
-* Everything is seeded and single-threaded where possible, so failures are
-  reproducible.
+| Layer | What | Where |
+|---|---|---|
+| Protocol | golden fixtures, every reject path, 200k fuzz cases | `crates/protocol/tests/wire.rs` |
+| Frame parser | round trips, every reject reason, checksums, filter, 100k fuzz, 100k differential vs `etherparse` | `crates/frame/tests/frames.rs` |
+| Sequencer | unit tests for every outcome, eviction, late join, resync, `u64::MAX`, accounting | `crates/engine/src/sequence.rs` |
+| Processor | session gate cases, heartbeats/EOS, sampling | `crates/engine/src/pipeline.rs` |
+| Audit regressions | P1–P7 | `crates/engine/tests/adversarial.rs` |
+| Properties | 60 (debug) / 600 (release) hostile random streams; invariants after every datagram; coverage of every path asserted | `crates/engine/tests/properties.rs` |
+| Allocation | zero allocations, processor and socket loop | `crates/engine/tests/alloc.rs` |
+| End to end | real sockets, burst-drained (no reliance on kernel buffering), faults, tail loss | `crates/engine/tests/loopback.rs` |
+| Linux backend | batching, kernel timestamps, exact kernel-drop accounting, truncation, filtering, full pipeline | `transport/recvmmsg.rs` (CI-only) |
+
+Gates on every commit (CI): fmt, clippy `-D warnings`, tests in debug
+**and** release on Ubuntu 24.04 and Windows, MSRV 1.88 build, `cargo deny`.
 
 ## 11. Main risks
 
-1. **Measurement validity on Windows.** Scheduler and timer behavior add
-   jitter that is not present on a tuned Linux host. Mitigation: repeated
-   runs, warmup exclusion, recording environment details, and Linux
-   validation via WSL2 and later bare metal.
-2. **No Linux environment yet.** Phases B and C are blocked until WSL2 is
-   installed (needs admin and a reboot, which is your action).
-3. **WSL2 is not bare metal.** It uses a Hyper-V virtual NIC and its own
-   kernel build; AF_XDP support depends on that kernel's config. Treat it as
-   a functional test bed, not a performance reference.
+1. **Nothing has run on Linux yet.** The Linux backend and multicast-on-`lo`
+   tests are compile-checked only until CI runs or a Linux environment
+   exists.
+2. **Thunderbolt NIC stability.** Surprise removal, link retraining, and
+   power management on the TB4 path must be engineered around (hardware plan
+   §5).
+3. **Mobile CPU on the target** (Tiger Lake U, 15–28 W): busy-polling plus
+   turbo means thermal and power-limit swings; must be measured
+   (`turbostat`) and pinned down (fixed frequency).
 4. **Single-threaded consumer coupling.** A slow sink stalls the receive
-   path. Mitigation: measure, then introduce an SPSC queue.
-5. **Hardware ceiling on `camlcompute`.** The I219-LM/e1000e has no native
-   XDP. DPDK's `em` PMD probe-lists the I219, but it is unvalidated there,
-   limited to 2 queues with no RSS or timestamp offload, and would take the
-   server's only port away from Linux. Either way, kernel bypass can show
-   little on this machine (section 9).
+   path; now detectable via kernel drops on Linux.
+5. **Data source unknown.** If the feed arrives over the public internet,
+   kernel bypass cannot matter (milliseconds of WAN jitter versus
+   microseconds of kernel cost).

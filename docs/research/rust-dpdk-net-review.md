@@ -1,7 +1,21 @@
 # Review: `youyuanwu/rust-dpdk-net` — lessons for a CAML DPDK backend
 
 Status: **research note**. Nothing in this document is implemented in the CAML
-workspace. The `DpdkSource` design below is **Planned**.
+workspace. The `DpdkSource` design below is **design only**.
+
+> **Addendum (2026-10-09).** An independent audit re-checked this note's key
+> claims against upstream commit `8670af4` and DPDK v25.11 and found them
+> accurate: the LIFO `rx_batch.pop()` (`dpdk_device.rs:256`; the "may have
+> reversed the batch" comment at `:251` is stale, since `RxQueue::rx` stores
+> the burst in wire order), the unconditional `rte_mempool_free` in
+> `MemPool::drop`, `TxQueue::tx`'s `remove(0)` loop, and the em PMD citations
+> (`em_ethdev.c:112-190`, `:1032`, `:1150`). New fact: the CAML box's NIC is
+> the I219-LM (13), device `0x15FB`, which Ubuntu 24.04's DPDK 23.11.4 does
+> **not** list (v25.11 does, at `em_ethdev.c:168`). **Decision changed:**
+> kernel bypass will use AF_XDP on an external Thunderbolt NIC, not DPDK
+> (`docs/decisions.md` D7–D9, `docs/hardware-plan.md`). The lessons below
+> (ownership of pool memory, wire-order bursts, shim pattern) still apply to
+> any future DPDK work.
 
 Method: read-only review of a shallow clone (outside the workspace) plus the
 GitHub, crates.io, DPDK, and smoltcp sources fetched over HTTPS. DPDK was not

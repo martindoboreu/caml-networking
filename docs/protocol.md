@@ -1,8 +1,13 @@
-# CAML Market-Data Wire Protocol — Version 1
+# CAML Market-Data Wire Protocol — Version 2
 
-Status: **implemented and tested** (`crates/protocol`). The golden byte fixture
-in `crates/protocol/tests/wire.rs` is the executable form of this document; if
-the two disagree, that is a bug.
+Status: **implemented, tested** (`crates/protocol`). The golden byte fixtures
+in `crates/protocol/tests/wire.rs` are the executable form of this document;
+if the two disagree, that is a bug.
+
+Version 2 replaced version 1 on 2026-10-09 after an audit found that v1's
+sequencing could not detect tail loss, order publisher restarts, or tell
+reordering at session start from duplication (see `docs/decisions.md`, D3).
+v1 packets are rejected as `UnsupportedVersion` and counted.
 
 ## Transport framing
 
@@ -26,16 +31,19 @@ one.)
 
 ## Packet header (32 bytes)
 
-| Offset | Size | Type  | Field          | Rules |
-|-------:|-----:|-------|----------------|-------|
-| 0      | 2    | bytes | `magic`        | ASCII `"CM"` (`0x43 0x4D`) |
-| 2      | 1    | u8    | `version`      | `1` |
-| 3      | 1    | u8    | `flags`        | Must be `0` (reserved) |
-| 4      | 4    | u32   | `session_id`   | Identifies one publisher run |
-| 8      | 8    | u64   | `packet_seq`   | +1 per packet within a session |
-| 16     | 8    | u64   | `send_time_ns` | Publisher wall clock, ns since Unix epoch, taken just before send |
-| 24     | 2    | u16   | `msg_count`    | `0` = heartbeat |
-| 26     | 6    | bytes | reserved       | Must be `0` |
+| Offset | Size | Type  | Field           | Rules |
+|-------:|-----:|-------|-----------------|-------|
+| 0      | 2    | bytes | `magic`         | ASCII `"CM"` (`0x43 0x4D`) |
+| 2      | 1    | u8    | `version`       | `2` |
+| 3      | 1    | u8    | `flags`         | bit 0 `END_OF_SESSION`; all other bits must be 0. `END_OF_SESSION` is only valid when `msg_count == 0` |
+| 4      | 2    | u16   | `msg_count`     | `0` = heartbeat |
+| 6      | 2    | bytes | reserved        | Must be `0` |
+| 8      | 8    | u64   | `session_epoch` | Non-zero. Publisher start time, ns since the Unix epoch. A restarted publisher must use a **strictly larger** value |
+| 16     | 8    | u64   | `first_seq`     | Non-zero. Data packet: `seq` of its first message. Heartbeat: the `seq` the publisher's next message will carry. `first_seq + msg_count` must not overflow `u64` |
+| 24     | 8    | u64   | `send_time_ns`  | Publisher wall clock, ns since the Unix epoch, taken immediately before the send call |
+
+Every 8-byte field is naturally aligned relative to the start of the
+datagram.
 
 ## Message (40 bytes)
 
@@ -45,7 +53,7 @@ one.)
 | 2      | 1    | u8   | `msg_type`      | `1` Trade, `2` BidUpdate, `3` AskUpdate |
 | 3      | 1    | u8   | `flags`         | Must be `0` (reserved) |
 | 4      | 4    | u32  | `instrument_id` | Publisher-assigned |
-| 8      | 8    | u64  | `seq`           | +1 per message within a session, contiguous across packets |
+| 8      | 8    | u64  | `seq`           | Must equal `first_seq + index` (messages in a packet are contiguous) |
 | 16     | 8    | u64  | `event_time_ns` | Source event time, ns since Unix epoch |
 | 24     | 8    | i64  | `price`         | Fixed point, 1e-9 units: `100.25` → `100_250_000_000` |
 | 32     | 8    | u64  | `quantity`      | Integer lots |
@@ -64,31 +72,44 @@ exactly, and arithmetic on them is not associative.
 ## Validation and error handling
 
 `parse_packet` validates the **entire** packet before returning anything:
-header magic, version, reserved bytes, exact length, and each message's
-length, type, and flags. If any check fails, the whole datagram is rejected
-with a specific `DecodeError`, and the receiver counts it by kind. No message
-from a rejected packet is delivered.
+magic, version, flags (including `END_OF_SESSION` only on heartbeats),
+reserved bytes, non-zero `session_epoch`, a valid `first_seq` range, exact
+length, and each message's length, type, flags, and sequence number. If any
+check fails, the whole datagram is rejected with a specific `DecodeError`
+(12 kinds), and the receiver counts it by kind. No message from a rejected
+packet is delivered.
 
-v1 receivers **reject unknown message types**. The `length` field exists so
-that a future version can define skip-unknown semantics, but v1 prefers loud
+v2 receivers **reject unknown message types**. The `length` field exists so
+that a future version can define skip-unknown semantics, but v2 prefers loud
 failure to silently ignoring data.
 
-## Sequencing semantics
+## Sequencing semantics (MoldUDP64 model)
 
-* Two independent sequence spaces: `packet_seq` (detects datagram loss,
-  duplication, reordering) and message `seq` (detects message-level loss and
-  lets consumers order events).
-* Heartbeats consume a `packet_seq` but no message `seq`. They exist so that
-  loss of the last data packet before an idle period is detectable.
-* A change of `session_id` means both sequences restarted. Receivers reset
-  their sequence state and count a session change.
-* There is no retransmission or snapshot recovery in v1. Loss is detected and
+* One sequence space per session: message `seq`, starting at **1**.
+* A data packet carries the contiguous range `[first_seq, first_seq + msg_count)`.
+* A heartbeat carries no messages; its `first_seq` is the next `seq` the
+  publisher will use. A receiver that has seen less than that knows the
+  difference was lost. **This is how loss of the final packets before an idle
+  period is detected.** Publishers send a heartbeat after every idle interval
+  (`caml-feed --heartbeat-ms`, default 100 ms).
+* The last packet of a session is a heartbeat with `END_OF_SESSION`. It tells
+  the receiver the session is complete (no undetectable tail) and that a newer
+  session may be adopted immediately.
+* `session_epoch` orders publisher runs. Receivers follow one session at a
+  time and only move to a different epoch under the rules in
+  `docs/architecture.md` §6 (session gate). A receiver rejects epochs more than
+  a configurable skew (default 300 s) ahead of its own clock.
+* There is no retransmission or snapshot recovery in v2. Loss is detected and
   reported, not repaired.
 
-## Not in v1 (planned or deliberately omitted)
+## Not in v2 (planned or deliberately omitted)
 
-* **No checksum.** UDP's checksum covers corruption in transit. An
-  application-level CRC would only matter for storage/replay.
+* **No checksum.** The UDP checksum covers corruption in transit on the
+  kernel path. Raw-packet backends verify it in software (`caml-frame`,
+  `ChecksumPolicy::Verify`) or trust NIC offload flags. An application-level
+  CRC would only matter for storage/replay.
 * No retransmission/gap-fill requests, no snapshots.
-* No multicast-specific fields (channel ids, A/B line arbitration).
+* No channel ids. A/B line arbitration works on `(session_epoch, seq)`: both
+  lines carry identical packets and the receiver delivers whichever arrives
+  first (planned; see `docs/hardware-plan.md`).
 * No order-level (L3) messages.
