@@ -267,6 +267,78 @@ mod tests {
     }
 
     #[test]
+    fn every_error_has_a_specific_message() {
+        let decode = [
+            DecodeError::TooShort { len: 3 },
+            DecodeError::BadMagic { found: *b"XY" },
+            DecodeError::UnsupportedVersion { found: 9 },
+            DecodeError::InvalidFlags { flags: 0x80 },
+            DecodeError::ReservedNonZero,
+            DecodeError::ZeroSessionEpoch,
+            DecodeError::InvalidSeqRange {
+                first_seq: 0,
+                msg_count: 1,
+            },
+            DecodeError::LengthMismatch {
+                expected: 72,
+                actual: 71,
+            },
+            DecodeError::BadMessageLength {
+                index: 2,
+                length: 39,
+            },
+            DecodeError::UnknownMessageType {
+                index: 1,
+                msg_type: 99,
+            },
+            DecodeError::MessageFlagsNonZero { index: 4 },
+            DecodeError::MessageSeqMismatch {
+                index: 0,
+                expected: 9,
+                found: 8,
+            },
+        ];
+        // One example per kind, in order, so this list cannot fall behind
+        // the enum.
+        let kinds: Vec<_> = decode.iter().map(DecodeError::kind).collect();
+        assert_eq!(kinds, DecodeErrorKind::ALL);
+
+        let encode = [
+            EncodeError::BufferFull {
+                needed: 40,
+                available: 10,
+            },
+            EncodeError::TooManyMessages,
+            EncodeError::ZeroSessionEpoch,
+            EncodeError::InvalidSeq,
+            EncodeError::SeqMismatch {
+                expected: 2,
+                found: 5,
+            },
+        ];
+
+        let messages: Vec<String> = decode
+            .iter()
+            .map(ToString::to_string)
+            .chain(encode.iter().map(ToString::to_string))
+            .collect();
+        for (i, m) in messages.iter().enumerate() {
+            assert!(!m.is_empty());
+            assert!(!messages[i + 1..].contains(m), "duplicate message: {m}");
+        }
+        // Messages carry the values needed to debug a rejection.
+        let has = |e: &dyn std::fmt::Display, parts: &[&str]| {
+            let m = e.to_string();
+            parts.iter().all(|p| m.contains(p))
+        };
+        assert!(has(&decode[7], &["72", "71"]));
+        assert!(has(&decode[11], &["message 0", "8", "9"]));
+        assert!(has(&decode[1], &["58", "59"])); // "XY" in hex
+        assert!(has(&encode[0], &["40", "10"]));
+        assert!(has(&encode[4], &["2", "5"]));
+    }
+
+    #[test]
     fn kind_names_are_unique() {
         for (i, a) in DecodeErrorKind::ALL.iter().enumerate() {
             for b in &DecodeErrorKind::ALL[i + 1..] {

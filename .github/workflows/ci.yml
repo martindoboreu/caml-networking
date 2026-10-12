@@ -56,7 +56,7 @@ jobs:
       - name: Enable multicast on loopback
         run: sudo ip link set lo multicast on
       - name: Measure line coverage (library crates)
-        run: bash scripts/coverage.sh
+        run: bash scripts/coverage.sh --fail-under 90
       - name: Job summary
         run: |
           pct=$(jq -r '.data[0].totals.lines.percent * 10 | round / 10' target/coverage.json)

@@ -12,7 +12,7 @@ AF_XDP experiments on `veth` pairs.
 | Building and testing Linux-only code (`recvmmsg`, `/proc` drop counts, `SO_TIMESTAMPNS`) | Performance numbers: WSL2 runs in a Hyper-V VM with a virtual NIC and its own kernel build. Never compare its latency with the target box |
 | Coverage measurement (same script as CI) | Anything involving a physical NIC (AF_XDP zero-copy, hardware timestamps) |
 | Running `caml-recv --backend recvmmsg` against `caml-feed` on loopback | |
-| AF_XDP copy mode on `veth` pairs (planned; depends on the WSL kernel's config) | |
+| AF_XDP copy mode on `veth` pairs (planned). The WSL2 kernel supports it: 6.18.40.1-microsoft-standard-WSL2 has `CONFIG_XDP_SOCKETS=y`, `CONFIG_BPF_SYSCALL=y`, `CONFIG_BPF_JIT=y`, `CONFIG_VETH=y`, and BTF (checked 2026-10-12 via `/proc/config.gz`) | |
 
 ## One-time setup
 
