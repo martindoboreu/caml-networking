@@ -52,6 +52,7 @@ impl Veth {
         // NIC puts a complete checksum on the wire; make veth do the same.
         let status = Command::new("ethtool")
             .args(["-K", &tx, "tx", "off"])
+            .stdout(std::process::Stdio::null())
             .status()
             .expect("run `ethtool` (apt install ethtool)");
         assert!(status.success(), "ethtool -K {tx} tx off failed");
