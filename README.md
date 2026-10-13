@@ -79,6 +79,7 @@ on Linux** (Linux-only code; CI and WSL2), **benchmarked**, **planned**,
 | Line coverage of library crates (`cargo-llvm-cov`), badge, per-run report | in use (CI and `scripts/coverage.sh`) |
 | Linux dev environment: WSL2 Ubuntu 24.04, `scripts/wsl-setup.sh` | in use ([guide](docs/linux-dev.md)) |
 | AF_XDP backend (`caml-transport-xdp`, feature `xdp`), copy mode on `veth` | implemented, tested on Linux (CI and WSL2; needs root) |
+| Automatic fallback from AF_XDP to `recvmmsg` at startup (`--xdp-no-fallback` to disable) | implemented, tested on Linux (CI and WSL2) |
 | AF_XDP zero-copy on a supported NIC | planned; needs the hardware in the plan |
 | External Thunderbolt NIC for zero-copy bypass | planned; see hardware plan |
 | DPDK backend | design only; **not on the onboard I219** (D8) |

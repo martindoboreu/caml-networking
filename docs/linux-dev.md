@@ -82,6 +82,10 @@ Things it handles that are easy to trip over (decision D15):
 * If the receiver is killed, libxdp's program stays attached to the
   interface but passes all traffic to the kernel. `ip link set dev <dev>
   xdpgeneric off` removes it (or delete the `veth`).
+* If AF_XDP cannot start at all, `caml-recv --backend xdp` falls back to
+  `recvmmsg` with the same socket options and says so in the banner and the
+  verdict (D16); `--xdp-no-fallback` makes it fail instead. The script's
+  third stage checks this on an interface that does not exist.
 
 ## Notes
 

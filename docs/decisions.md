@@ -128,3 +128,17 @@ Rejected frames are counted by reason, split into `filtered_frames` (not for
 us) and `corrupt_frames` (loss). *Revisit* if libxdp's attach semantics
 become a problem in production; the alternative is a `bpf_link`-attached
 program we own.
+
+**D16. Automatic fallback from AF_XDP to `recvmmsg`, decided at startup
+(2026-10-12).** `caml-recv --backend xdp` uses `FallbackSource`: if AF_XDP
+cannot start (no privileges, no such interface, unsupported driver, queue
+still busy after the retry window), it binds `recvmmsg` with the same socket
+options (`--bind`, `--group`, `--iface`, ...) and keeps running. The
+fallback is never silent: the reason goes to the startup banner, and the
+final verdict carries a WARNING. `--xdp-no-fallback` turns it off, and CI's
+AF_XDP run uses that flag, because otherwise a broken AF_XDP path would
+quietly fall back and the job would still pass. Not done: failing over
+*mid-run* if AF_XDP breaks after starting (e.g. a Thunderbolt NIC unplugged).
+That ends the run with an error today; adding it would be safe for
+integrity, since the sequencer would report any messages lost during the
+switch.

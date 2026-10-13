@@ -76,6 +76,7 @@ copy:
 | `UdpSource` | `recv_from` into an owned 64 KiB buffer, lend `&buf[..n]` | implemented, tested |
 | `RecvMmsgSource` (Linux) | one `recvmmsg` fills 32 slots; lend each; per-datagram kernel timestamp | implemented; tested on Linux CI only |
 | AF_XDP (`caml-transport-xdp`, feature `xdp`) | lend each UMEM frame's UDP payload (validated by `caml-frame`), return the frame to the fill ring after the callback | implemented; tested on Linux (CI and WSL2, `veth`, copy mode; needs root) |
+| `FallbackSource` | AF_XDP if it starts, otherwise `RecvMmsgSource`; decided once at bind and reported (D16) | implemented; tested on Linux |
 | DPDK | lend each mbuf's UDP payload in wire order, bulk-free the burst | design only; not on the I219 (D8) |
 
 Generic (`F: FnMut`) rather than `&mut dyn FnMut` so the per-packet call is
