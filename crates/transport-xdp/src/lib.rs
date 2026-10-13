@@ -12,6 +12,9 @@
 //! no socket is bound) to the normal kernel stack. See `docs/decisions.md`
 //! (D15) for the attach and crash behavior this implies.
 //!
+//! `FallbackSource` tries AF_XDP and, if it cannot start, binds the kernel's
+//! batched `recvmmsg` backend instead, reporting why (decision D16).
+//!
 //! Linux only, behind the `xdp` feature; without it this crate is empty.
 //! Development and CI use `veth` pairs (`scripts/xdp-veth.sh`); never attach
 //! to a physical interface without authorization (AGENTS.md).
@@ -19,8 +22,12 @@
 #![warn(missing_docs)]
 
 #[cfg(all(target_os = "linux", feature = "xdp"))]
+mod fallback;
+#[cfg(all(target_os = "linux", feature = "xdp"))]
 mod source;
 
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+pub use fallback::{Backend, FallbackSource};
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 pub use source::{XdpConfig, XdpMode, XdpSource, XdpStats};
 

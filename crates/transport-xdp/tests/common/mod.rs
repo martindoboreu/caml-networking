@@ -92,7 +92,12 @@ impl Drop for Veth {
 }
 
 /// Polls until `want` payloads were delivered or 5 s pass; returns how many.
-pub fn drain(src: &mut XdpSource, want: u64, mut f: impl FnMut(&[u8], RxMeta)) -> u64 {
+pub fn drain(src: &mut XdpSource, want: u64, f: impl FnMut(&[u8], RxMeta)) -> u64 {
+    drain_any(src, want, f)
+}
+
+/// [`drain`] for any packet source.
+pub fn drain_any<S: PacketSource>(src: &mut S, want: u64, mut f: impl FnMut(&[u8], RxMeta)) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut got = 0;
     while got < want && Instant::now() < deadline {

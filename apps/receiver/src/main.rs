@@ -63,6 +63,11 @@ struct Args {
     #[arg(long)]
     xdp_zero_copy: bool,
 
+    /// Fail instead of falling back to `recvmmsg` (with the same socket
+    /// options) when AF_XDP cannot start.
+    #[arg(long)]
+    xdp_no_fallback: bool,
+
     /// Local address to bind. For multicast on Linux, bind the group address
     /// (or 0.0.0.0) and the feed's port.
     #[arg(long, default_value = "127.0.0.1:40000")]
@@ -210,7 +215,7 @@ fn print_transport(t: &TransportStats) {
 }
 
 /// Prints the verdict; returns whether the run was clean.
-fn print_verdict(snapshot: &Snapshot, transport: &TransportStats) -> bool {
+fn print_verdict(snapshot: &Snapshot, transport: &TransportStats, note: Option<&str>) -> bool {
     let v = snapshot.integrity();
     let transport_loss = transport
         .truncated
@@ -245,6 +250,9 @@ fn print_verdict(snapshot: &Snapshot, transport: &TransportStats) -> bool {
             "  note: {} datagrams from non-allowed sources were dropped",
             transport.filtered_source
         );
+    }
+    if let Some(note) = note {
+        println!("  WARNING: {note}");
     }
     if v.unterminated_sessions > 0 {
         println!(
@@ -330,23 +338,23 @@ fn real_main() -> Result<bool, String> {
             let source = UdpSource::bind(&config).map_err(bind_err)?;
             let local = source.local_addr().map_err(|e| e.to_string())?;
             let banner = socket_banner(local, source.granted_recv_buffer());
-            receive(source, &banner, &run_args)
+            receive(source, &banner, None, &run_args)
         }
         #[cfg(target_os = "linux")]
         Backend::Recvmmsg => {
             let source = RecvMmsgSource::bind(&config).map_err(bind_err)?;
             let local = source.local_addr().map_err(|e| e.to_string())?;
             let banner = socket_banner(local, source.granted_recv_buffer());
-            receive(source, &banner, &run_args)
+            receive(source, &banner, None, &run_args)
         }
         #[cfg(not(target_os = "linux"))]
         Backend::Recvmmsg => Err("--backend recvmmsg requires Linux".into()),
         #[cfg(all(target_os = "linux", feature = "xdp"))]
         Backend::Xdp => {
+            use caml_transport_xdp::{FallbackSource, XdpSource};
+
             let xdp = xdp_config(&args)?;
-            let source = caml_transport_xdp::XdpSource::bind(&xdp)
-                .map_err(|e| format!("AF_XDP on {}: {e}", xdp.interface))?;
-            let banner = format!(
+            let xdp_banner = format!(
                 "AF_XDP {} queue {} ({:?} mode, {}) filter {:?}",
                 xdp.interface,
                 xdp.queue_id,
@@ -354,7 +362,27 @@ fn real_main() -> Result<bool, String> {
                 if xdp.zero_copy { "zero-copy" } else { "copy" },
                 xdp.filter
             );
-            receive(source, &banner, &run_args)
+            if args.xdp_no_fallback {
+                let source = XdpSource::bind(&xdp)
+                    .map_err(|e| format!("AF_XDP on {}: {e}", xdp.interface))?;
+                return receive(source, &xdp_banner, None, &run_args);
+            }
+            let source = FallbackSource::bind(&xdp, &config).map_err(|e| e.to_string())?;
+            let Some(reason) = source.fallback_reason().map(str::to_owned) else {
+                return receive(source, &xdp_banner, None, &run_args);
+            };
+            eprintln!(
+                "caml-recv: {reason}; falling back to recvmmsg (disable with --xdp-no-fallback)"
+            );
+            let local = source
+                .local_addr()
+                .ok_or("the recvmmsg fallback has no local address")?;
+            let banner = format!(
+                "{} [recvmmsg fallback]",
+                socket_banner(local, source.granted_recv_buffer().unwrap_or(0))
+            );
+            let note = format!("ran on the recvmmsg fallback because {reason}");
+            receive(source, &banner, Some(&note), &run_args)
         }
         #[cfg(not(all(target_os = "linux", feature = "xdp")))]
         Backend::Xdp => {
@@ -364,6 +392,7 @@ fn real_main() -> Result<bool, String> {
                 args.xdp_queue,
                 args.xdp_mode,
                 args.xdp_zero_copy,
+                args.xdp_no_fallback,
             );
             Err("--backend xdp needs Linux and a build with `--features caml-recv/xdp`".into())
         }
@@ -415,7 +444,13 @@ struct RunArgs<'a> {
 }
 
 /// Runs the receive loop on any backend and prints the final report.
-fn receive<S: PacketSource>(mut source: S, banner: &str, r: &RunArgs<'_>) -> Result<bool, String> {
+/// `note` is a warning to print with the verdict (e.g. a backend fallback).
+fn receive<S: PacketSource>(
+    mut source: S,
+    banner: &str,
+    note: Option<&str>,
+    r: &RunArgs<'_>,
+) -> Result<bool, String> {
     let (args, limits, processor_config, stop) = (r.args, r.limits, r.processor_config, r.stop);
     eprintln!(
         "caml-recv: backend={:?} listening on {banner}, Ctrl-C to stop",
@@ -463,6 +498,6 @@ fn receive<S: PacketSource>(mut source: S, banner: &str, r: &RunArgs<'_>) -> Res
     );
     print_transport(&transport);
     print!("{snapshot}");
-    let clean = print_verdict(&snapshot, &transport);
+    let clean = print_verdict(&snapshot, &transport, note);
     Ok(clean || !args.fail_on_loss)
 }

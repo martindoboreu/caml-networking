@@ -117,10 +117,23 @@ impl std::fmt::Debug for XdpSource {
     }
 }
 
+fn cause(e: &xsk_rs::socket::SocketCreateError) -> Option<&io::Error> {
+    e.source().and_then(|s| s.downcast_ref::<io::Error>())
+}
+
 fn is_busy(e: &xsk_rs::socket::SocketCreateError) -> bool {
-    e.source()
-        .and_then(|s| s.downcast_ref::<io::Error>())
-        .is_some_and(|io| io.kind() == io::ErrorKind::ResourceBusy)
+    cause(e).is_some_and(|io| io.kind() == io::ErrorKind::ResourceBusy)
+}
+
+/// `SocketCreateError` displays only "non-zero error code returned when
+/// creating AF_XDP socket". Keep the OS error's kind and text, so callers
+/// (and the fallback's report) can tell a missing interface from missing
+/// privileges.
+fn socket_error(e: xsk_rs::socket::SocketCreateError) -> io::Error {
+    match cause(&e) {
+        Some(os) => io::Error::new(os.kind(), format!("{e}: {os}")),
+        None => io::Error::other(e),
+    }
 }
 
 impl XdpSource {
@@ -160,7 +173,7 @@ impl XdpSource {
                 Err(e) if is_busy(&e) && Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => return Err(io::Error::other(e)),
+                Err(e) => return Err(socket_error(e)),
             }
         };
         let (mut fill_q, comp_q) = fq_and_cq
