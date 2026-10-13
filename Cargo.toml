@@ -6,6 +6,7 @@ members = [
     "crates/frame",
     "crates/sim",
     "crates/alloc-count",
+    "crates/transport-xdp",
     "apps/receiver",
     "apps/feed-generator",
     "apps/bench",
@@ -26,6 +27,7 @@ caml-engine = { path = "crates/engine" }
 caml-frame = { path = "crates/frame" }
 caml-sim = { path = "crates/sim" }
 caml-alloc-count = { path = "crates/alloc-count" }
+caml-transport-xdp = { path = "crates/transport-xdp" }
 socket2 = { version = "0.6.5", features = ["all"] }
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"

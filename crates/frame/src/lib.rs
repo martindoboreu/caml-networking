@@ -118,6 +118,26 @@ impl FrameError {
         self as usize
     }
 
+    /// Whether the frame was damaged or undeliverable (counted as loss), as
+    /// opposed to valid traffic for some other receiver.
+    pub const fn is_corruption(self) -> bool {
+        match self {
+            Self::Truncated
+            | Self::BadIpHeader
+            | Self::Fragmented
+            | Self::BadUdpLength
+            | Self::BadIpChecksum
+            | Self::BadUdpChecksum => true,
+            Self::NotIpv4
+            | Self::UnsupportedVlan
+            | Self::NotUdp
+            | Self::VlanMismatch
+            | Self::DstIpMismatch
+            | Self::DstPortMismatch
+            | Self::SourceRejected => false,
+        }
+    }
+
     /// Stable snake_case name for logs and reports.
     pub const fn name(self) -> &'static str {
         match self {
@@ -357,6 +377,26 @@ mod tests {
                 assert_ne!(e.name(), other.name());
             }
         }
+    }
+
+    #[test]
+    fn corruption_classification() {
+        let corrupt: Vec<_> = FrameError::ALL
+            .iter()
+            .filter(|e| e.is_corruption())
+            .map(|e| e.name())
+            .collect();
+        assert_eq!(
+            corrupt,
+            [
+                "truncated",
+                "bad_ip_header",
+                "fragmented",
+                "bad_udp_length",
+                "bad_ip_checksum",
+                "bad_udp_checksum"
+            ]
+        );
     }
 
     #[test]

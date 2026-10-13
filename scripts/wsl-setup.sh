@@ -15,7 +15,8 @@ cd "$(dirname "$0")/.."
 echo "==> system packages"
 sudo apt-get update -qq
 sudo apt-get install -y -qq --no-install-recommends \
-  build-essential pkg-config git curl ca-certificates iproute2 jq
+  build-essential pkg-config git curl ca-certificates iproute2 jq \
+  clang llvm libclang-dev libelf-dev zlib1g-dev libpcap-dev m4 gcc-multilib ethtool
 
 echo "==> Rust (rustup; the toolchain is pinned by rust-toolchain.toml)"
 if ! command -v rustup >/dev/null 2>&1; then
@@ -44,4 +45,5 @@ cat <<'EOF'
     source ~/.cargo/env
     bash scripts/check.sh        # every CI gate
     bash scripts/coverage.sh     # line coverage (add --html for a browsable report)
+    bash scripts/xdp-veth.sh     # AF_XDP receiver on a veth pair (sudo)
 EOF

@@ -24,8 +24,20 @@ enum Backend {
     Udp,
     /// Linux: batched `recvmmsg`, with kernel receive timestamps
     /// (`SO_TIMESTAMPNS`). Kernel drop counts are read on Linux for both
-    /// backends.
+    /// socket backends.
     Recvmmsg,
+    /// Linux, built with `--features xdp`: AF_XDP on `--xdp-iface`, frames
+    /// filtered by `--bind` port, `--group`, and `--allow-source`. Needs root.
+    Xdp,
+}
+
+/// XDP attach mode for `--backend xdp`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum XdpModeArg {
+    /// Generic (SKB) mode: works on any interface, including `veth`.
+    Generic,
+    /// Native (driver) mode: needs driver support.
+    Native,
 }
 
 #[derive(Parser, Debug)]
@@ -34,6 +46,22 @@ struct Args {
     /// Receive backend.
     #[arg(long, value_enum, default_value_t = Backend::Udp)]
     backend: Backend,
+
+    /// Interface for `--backend xdp` (use a `veth` end for experiments).
+    #[arg(long)]
+    xdp_iface: Option<String>,
+
+    /// Queue of `--xdp-iface` to bind.
+    #[arg(long, default_value_t = 0)]
+    xdp_queue: u32,
+
+    /// XDP attach mode.
+    #[arg(long, value_enum, default_value_t = XdpModeArg::Generic)]
+    xdp_mode: XdpModeArg,
+
+    /// Request AF_XDP zero-copy (needs driver support; `veth` has none).
+    #[arg(long)]
+    xdp_zero_copy: bool,
 
     /// Local address to bind. For multicast on Linux, bind the group address
     /// (or 0.0.0.0) and the feed's port.
@@ -169,9 +197,11 @@ fn main() -> ExitCode {
 
 fn print_transport(t: &TransportStats) {
     println!(
-        "  transport   datagrams={} filtered_source={} truncated={} transient_errors={} kernel_drops={}",
+        "  transport   datagrams={} filtered_source={} filtered_frames={} corrupt_frames={} truncated={} transient_errors={} kernel_drops={}",
         t.datagrams,
         t.filtered_source,
+        t.filtered_frames,
+        t.corrupt_frames,
         t.truncated,
         t.transient_errors,
         t.kernel_drops
@@ -182,10 +212,11 @@ fn print_transport(t: &TransportStats) {
 /// Prints the verdict; returns whether the run was clean.
 fn print_verdict(snapshot: &Snapshot, transport: &TransportStats) -> bool {
     let v = snapshot.integrity();
-    let kernel_or_truncated = transport
+    let transport_loss = transport
         .truncated
+        .saturating_add(transport.corrupt_frames)
         .saturating_add(transport.kernel_drops.unwrap_or(0));
-    let clean = v.is_clean() && kernel_or_truncated == 0;
+    let clean = v.is_clean() && transport_loss == 0;
     println!(
         "caml-recv: verdict: {}",
         if clean {
@@ -195,13 +226,13 @@ fn print_verdict(snapshot: &Snapshot, transport: &TransportStats) -> bool {
         }
     );
     println!(
-        "  lost_messages={} malformed={} implausible_pkts={} rejected_session_pkts={} before_baseline={} kernel_or_truncated={}",
+        "  lost_messages={} malformed={} implausible_pkts={} rejected_session_pkts={} before_baseline={} transport_loss={}",
         v.lost_messages,
         v.malformed,
         v.implausible_packets,
         v.rejected_session_packets,
         v.before_baseline,
-        kernel_or_truncated
+        transport_loss
     );
     if v.missed_before_join > 0 {
         println!(
@@ -279,59 +310,116 @@ fn real_main() -> Result<bool, String> {
 
     let run_args = RunArgs {
         args: &args,
-        config: &config,
         limits,
         processor_config,
         stop: &stop,
     };
     let bind_err = |e: std::io::Error| format!("bind {}: {e}", args.bind);
+    let socket_banner = |local: SocketAddr, granted: usize| {
+        format!(
+            "{local}{} (SO_RCVBUF requested={} granted={granted})",
+            args.group
+                .map_or_else(String::new, |g| format!(" group={g} iface={}", args.iface)),
+            config
+                .recv_buffer_bytes
+                .map_or_else(|| "default".to_string(), |b| b.to_string()),
+        )
+    };
     match args.backend {
         Backend::Udp => {
             let source = UdpSource::bind(&config).map_err(bind_err)?;
             let local = source.local_addr().map_err(|e| e.to_string())?;
-            let granted = source.granted_recv_buffer();
-            receive(source, local, granted, &run_args)
+            let banner = socket_banner(local, source.granted_recv_buffer());
+            receive(source, &banner, &run_args)
         }
         #[cfg(target_os = "linux")]
         Backend::Recvmmsg => {
             let source = RecvMmsgSource::bind(&config).map_err(bind_err)?;
             let local = source.local_addr().map_err(|e| e.to_string())?;
-            let granted = source.granted_recv_buffer();
-            receive(source, local, granted, &run_args)
+            let banner = socket_banner(local, source.granted_recv_buffer());
+            receive(source, &banner, &run_args)
         }
         #[cfg(not(target_os = "linux"))]
         Backend::Recvmmsg => Err("--backend recvmmsg requires Linux".into()),
+        #[cfg(all(target_os = "linux", feature = "xdp"))]
+        Backend::Xdp => {
+            let xdp = xdp_config(&args)?;
+            let source = caml_transport_xdp::XdpSource::bind(&xdp)
+                .map_err(|e| format!("AF_XDP on {}: {e}", xdp.interface))?;
+            let banner = format!(
+                "AF_XDP {} queue {} ({:?} mode, {}) filter {:?}",
+                xdp.interface,
+                xdp.queue_id,
+                xdp.mode,
+                if xdp.zero_copy { "zero-copy" } else { "copy" },
+                xdp.filter
+            );
+            receive(source, &banner, &run_args)
+        }
+        #[cfg(not(all(target_os = "linux", feature = "xdp")))]
+        Backend::Xdp => {
+            // Read so a build without the feature has no unused options.
+            let _ = (
+                &args.xdp_iface,
+                args.xdp_queue,
+                args.xdp_mode,
+                args.xdp_zero_copy,
+            );
+            Err("--backend xdp needs Linux and a build with `--features caml-recv/xdp`".into())
+        }
     }
+}
+
+/// Builds the AF_XDP configuration: the UDP port comes from `--bind`, the
+/// destination address from `--group` (or a specific `--bind` address), and
+/// the source from a single `--allow-source`.
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+fn xdp_config(args: &Args) -> Result<caml_transport_xdp::XdpConfig, String> {
+    use caml_transport_xdp::{FrameFilter, XdpConfig, XdpMode};
+
+    let interface = args
+        .xdp_iface
+        .clone()
+        .ok_or("--backend xdp needs --xdp-iface")?;
+    let src_ip = match args.allow_sources.as_slice() {
+        [] => None,
+        [IpAddr::V4(ip)] => Some(*ip),
+        _ => return Err("--backend xdp accepts at most one IPv4 --allow-source".into()),
+    };
+    let dst_ip = args.group.or(match args.bind.ip() {
+        IpAddr::V4(ip) if !ip.is_unspecified() => Some(ip),
+        _ => None,
+    });
+    let filter = FrameFilter {
+        dst_ip,
+        src_ip,
+        ..FrameFilter::port(args.bind.port())
+    };
+    let mut config = XdpConfig::new(interface, filter);
+    config.queue_id = args.xdp_queue;
+    config.mode = match args.xdp_mode {
+        XdpModeArg::Generic => XdpMode::Generic,
+        XdpModeArg::Native => XdpMode::Native,
+    };
+    config.zero_copy = args.xdp_zero_copy;
+    config.poll_timeout = Duration::from_millis(args.poll_timeout_ms);
+    Ok(config)
 }
 
 /// Everything the receive loop needs besides the source.
 struct RunArgs<'a> {
     args: &'a Args,
-    config: &'a UdpConfig,
     limits: RunLimits,
     processor_config: ProcessorConfig,
     stop: &'a AtomicBool,
 }
 
 /// Runs the receive loop on any backend and prints the final report.
-fn receive<S: PacketSource>(
-    mut source: S,
-    local: SocketAddr,
-    granted: usize,
-    r: &RunArgs<'_>,
-) -> Result<bool, String> {
-    let (args, config, limits, processor_config, stop) =
-        (r.args, r.config, r.limits, r.processor_config, r.stop);
+fn receive<S: PacketSource>(mut source: S, banner: &str, r: &RunArgs<'_>) -> Result<bool, String> {
+    let (args, limits, processor_config, stop) = (r.args, r.limits, r.processor_config, r.stop);
     eprintln!(
-        "caml-recv: backend={:?} listening on {}{} (SO_RCVBUF requested={} granted={}), Ctrl-C to stop",
-        args.backend,
-        local,
-        args.group
-            .map_or_else(String::new, |g| format!(" group={g} iface={}", args.iface)),
-        config
-            .recv_buffer_bytes
-            .map_or_else(|| "default".to_string(), |b| b.to_string()),
-        granted
+        "caml-recv: backend={:?} listening on {banner}, Ctrl-C to stop",
+        args.backend
     );
 
     let mut processor = FeedProcessor::with_config(

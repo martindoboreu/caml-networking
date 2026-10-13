@@ -12,6 +12,11 @@ caml-engine.workspace = true
 caml-protocol.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+caml-transport-xdp = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[features]
+# `--backend xdp` (Linux): builds vendored libxdp/libbpf; see docs/linux-dev.md.
+xdp = ["dep:caml-transport-xdp", "caml-transport-xdp/xdp"]

@@ -65,6 +65,12 @@ pub struct TransportStats {
     pub filtered_source: u64,
     /// Datagrams dropped because they exceeded the receive buffer.
     pub truncated: u64,
+    /// Raw-frame backends: frames not addressed to this receiver (another
+    /// protocol, port, group, or VLAN). Not loss.
+    pub filtered_frames: u64,
+    /// Raw-frame backends: frames that failed validation (truncated, bad
+    /// checksum, bad header, fragment). Counted as loss.
+    pub corrupt_frames: u64,
     /// Transient receive errors that were counted and survived (e.g. an ICMP
     /// error reported on a UDP socket).
     pub transient_errors: u64,
@@ -76,10 +82,12 @@ pub struct TransportStats {
 }
 
 impl TransportStats {
-    /// Datagrams the transport knows it did not deliver.
+    /// Datagrams the transport knows it did not deliver, excluding frames
+    /// that were simply not addressed to this receiver.
     pub fn dropped(&self) -> u64 {
         self.filtered_source
             .saturating_add(self.truncated)
+            .saturating_add(self.corrupt_frames)
             .saturating_add(self.kernel_drops.unwrap_or(0))
     }
 }
@@ -141,5 +149,10 @@ mod tests {
         assert_eq!(s.dropped(), 5);
         s.kernel_drops = Some(10);
         assert_eq!(s.dropped(), 15);
+        s.corrupt_frames = 1;
+        assert_eq!(s.dropped(), 16);
+        // Frames for someone else are not loss.
+        s.filtered_frames = 100;
+        assert_eq!(s.dropped(), 16);
     }
 }

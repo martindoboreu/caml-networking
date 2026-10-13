@@ -89,6 +89,25 @@ jobs:
             commit -q -m "Coverage ${pct}% at ${GITHUB_SHA::7}"
           git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" badges
 
+  xdp:
+    name: AF_XDP on veth
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Native dependencies (vendored libxdp/libbpf)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            clang llvm libclang-dev libelf-dev zlib1g-dev libpcap-dev m4 gcc-multilib jq ethtool
+      - name: Install the pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: Clippy (xdp feature)
+        run: >
+          cargo clippy -p caml-transport-xdp -p caml-recv
+          --features caml-transport-xdp/xdp,caml-recv/xdp --all-targets --locked -- -D warnings
+      - name: AF_XDP tests and end-to-end run on a veth pair
+        run: bash scripts/xdp-veth.sh
+
   msrv:
     name: MSRV (1.88)
     runs-on: ubuntu-24.04
