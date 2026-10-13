@@ -202,8 +202,8 @@ legitimate outcome.
 | Milestone | Work | Needs | Exit criterion |
 |---|---|---|---|
 | S1 | Push to GitHub; CI green on Ubuntu 24.04 and Windows | a remote | Linux-only tests (recvmmsg backend, multicast on `lo`) pass in CI |
-| S2 | Linux dev environment (WSL2 or VM) with `veth` pairs | owner's decision | `caml-recv --backend recvmmsg` runs locally; `tcpreplay` of `caml-feed --pcap-out` into a `veth` |
-| S3 | `caml-transport-xdp` crate: UMEM, fill/RX rings, `bpf_link`-attached XDP redirect program, `caml-frame` filter, per-reason drop counters, fallback to `recvmmsg` on init failure | S2 | Copy mode on `veth`: replaying the same pcap through `udp`, `recvmmsg`, and AF_XDP gives identical event streams and counters |
+| S2 | Linux dev environment (WSL2 or VM) with `veth` pairs | done (2026-10-12) | **Done:** WSL2 Ubuntu 24.04 (`docs/linux-dev.md`); all CI gates and coverage run locally |
+| S3 | `caml-transport-xdp` crate: UMEM, fill/RX rings, XDP redirect program (libxdp's, D15), `caml-frame` filter, per-reason drop counters | S2 | **Done (copy mode on `veth`):** exact accounting, zero allocations, crash-safe restart, 20,000-packet CLI run (`scripts/xdp-veth.sh`, in CI). Open: automatic fallback to `recvmmsg` on init failure, and a cross-backend replay test asserting identical event streams |
 | S4 | Box bring-up (§5), M1–M3 | authorization | Baseline numbers committed to `docs/benchmarks.md` |
 | S5 | Hardware arrives: M4–M6, soak, decision gate | §3 purchases | Decision recorded in `docs/decisions.md` |
 | S6 | Production hardening: A/B line arbitration, systemd unit, metrics export, runbooks | S5 | Install/upgrade/rollback rehearsed on the box |

@@ -26,8 +26,12 @@
 * `unsafe` is forbidden workspace-wide. A crate that needs it must opt out
   explicitly in its own `[lints]` table (`unsafe_code = "deny"`, allowed only
   where needed), deny `clippy::undocumented_unsafe_blocks`, and document a
-  safety invariant on every `unsafe` block. Current exception:
-  `caml-alloc-count` (test-only). Planned: the AF_XDP backend crate. Prefer
+  safety invariant on every `unsafe` block. Current exceptions:
+  `caml-alloc-count` (test-only) and `caml-transport-xdp` (AF_XDP; `unsafe`
+  only in `source.rs`, each call matching an `xsk-rs` safety
+  contract). The AF_XDP code builds behind the `xdp` feature; CI clippies and
+  tests it, and its privileged tests run only on `veth` pairs
+  (`scripts/xdp-veth.sh`). Prefer
   safe wrappers (`nix`, `socket2`) to raw FFI.
 * The receive path must not allocate (enforced by
   `crates/engine/tests/alloc.rs`), panic on any input (enforced by the

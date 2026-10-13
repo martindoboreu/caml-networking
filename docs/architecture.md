@@ -34,6 +34,7 @@ that touches the CAML server (`camlcompute`) without written authorization.
 | `crates/frame`        | `caml-frame`       | Ethernet/802.1Q/IPv4/UDP parsing and filtering for raw-packet backends (AF_XDP, DPDK). No I/O, no deps. | none (dev: `etherparse` as test oracle) |
 | `crates/sim`          | `caml-sim`         | Deterministic synthetic market, fault injection, Ethernet framing + pcap writer. Test tooling. | protocol |
 | `crates/alloc-count`  | `caml-alloc-count` | Test-only counting allocator proving the receive path never allocates. The only crate with `unsafe` (see D10). | none |
+| `crates/transport-xdp` | `caml-transport-xdp` | AF_XDP receive backend (Linux, feature `xdp`): UMEM and rings via `xsk-rs`, libxdp's redirect program, `caml-frame` filtering. Documented `unsafe` (D15). | engine, frame; optional `xsk-rs` |
 | `apps/receiver`       | `caml-recv`        | CLI receiver: backends, multicast, source allowlist, integrity verdict, exit codes. | engine, `clap`, `ctrlc` |
 | `apps/feed-generator` | `caml-feed`        | CLI publisher: pacing, heartbeats, end-of-session, faults, multicast, pcap output. | sim, `socket2`, `clap` |
 | `apps/bench`          | `caml-bench`       | Reproducible micro and loopback benchmarks. | engine, sim, `clap` |
@@ -44,10 +45,10 @@ so they stay dependency-free and I/O-free. `sim` and `alloc-count` are test
 tooling and never linked into production binaries. Everything else is a
 module of `engine` until a real reason appears.
 
-The **planned** AF_XDP backend will be its own crate (`caml-transport-xdp`),
-the second crate allowed to contain `unsafe`, with a `// SAFETY:` comment on
-every block (enforced by `clippy::undocumented_unsafe_blocks`). `caml-engine`
-will not depend on it.
+The AF_XDP backend is its own crate (`caml-transport-xdp`, behind the
+`xdp` feature), the second crate allowed to contain `unsafe`, with a
+`// SAFETY:` comment on every block (enforced by
+`clippy::undocumented_unsafe_blocks`). `caml-engine` does not depend on it.
 
 ## 3. Key interfaces
 
@@ -74,7 +75,7 @@ copy:
 |---|---|---|
 | `UdpSource` | `recv_from` into an owned 64 KiB buffer, lend `&buf[..n]` | implemented, tested |
 | `RecvMmsgSource` (Linux) | one `recvmmsg` fills 32 slots; lend each; per-datagram kernel timestamp | implemented; tested on Linux CI only |
-| AF_XDP | lend a UMEM frame's UDP payload (via `caml-frame`), recycle to the fill ring after the callback | planned |
+| AF_XDP (`caml-transport-xdp`, feature `xdp`) | lend each UMEM frame's UDP payload (validated by `caml-frame`), return the frame to the fill ring after the callback | implemented; tested on Linux (CI and WSL2, `veth`, copy mode; needs root) |
 | DPDK | lend each mbuf's UDP payload in wire order, bulk-free the burst | design only; not on the I219 (D8) |
 
 Generic (`F: FnMut`) rather than `&mut dyn FnMut` so the per-packet call is
@@ -219,7 +220,13 @@ on a capable NIC in production. DPDK stays design-only
 (`docs/research/rust-dpdk-net-review.md`) until AF_XDP zero-copy measurably
 falls short.
 
-Raw-packet groundwork that is **implemented and tested** now:
+**AF_XDP status: implemented, copy mode on `veth`, tested on Linux** (CI and
+WSL2; `scripts/xdp-veth.sh`): exact accounting, zero allocations on the
+receive path, crash-safe restart, and a 20,000-packet end-to-end run of
+`caml-feed` -> `caml-recv --backend xdp`. Attach and crash semantics are in
+D15. Zero-copy on a physical NIC is next, and needs the hardware.
+
+Raw-packet building blocks, **implemented and tested**:
 `caml-frame` (Ethernet/VLAN/IPv4/UDP parse + filter + per-reason counters,
 differentially tested against `etherparse` on 100,000 mutated frames) and
 `caml-sim::pcap` + `caml-feed --pcap-out` (Ethernet-framed captures for

@@ -49,6 +49,9 @@ hugepages, vfio, or IOMMU grouping; a `bpf_link`-attached program detaches
 automatically on crash; copy mode works on `veth` for development and
 zero-copy works on supported NICs with the same code. *Revisit* if AF_XDP
 zero-copy on a supported NIC measurably misses the target.
+*Correction (2026-10-12, D15):* the implementation uses libxdp's standard
+program, which is **not** `bpf_link`-attached; after a crash it stays
+attached, but passes all traffic to the kernel, so nothing is lost.
 
 **D8. No DPDK on the onboard I219-LM.** Verified: Ubuntu 24.04's DPDK
 23.11.4 does not list device `0x15FB`; v25.11 does but the PMD is not
@@ -98,3 +101,30 @@ read the socket's `sk_drops` from `/proc/net/udp` in `stats()` (a reporting
 path; `poll` stays allocation-free), and the batched backend requests only
 the fixed-size timestamp control message. *Revisit* if `nix` restores
 `msg_controllen` per call, or if per-datagram drop attribution is needed.
+
+**D15. AF_XDP backend: `xsk-rs` + libxdp's program, behind a feature
+(2026-10-12).** `caml-transport-xdp` uses `xsk-rs` (MIT, maintained) for
+UMEM and rings, and libxdp's standard redirect program for the kernel side,
+rather than hand-written ring code and BPF. It sits behind the off-by-default
+`xdp` feature because it builds vendored libxdp/libbpf (clang, libelf, zlib,
+libpcap headers), which would otherwise burden every Windows, MSRV, and
+default Linux build; CI builds and runs it in its own job. Measured on WSL2
+(kernel 6.18) with `veth` pairs:
+* A clean exit detaches the program. After `kill -9` the program **stays
+  attached**, but libxdp's program redirects only to a bound socket and
+  otherwise returns `XDP_PASS` (`xsk_def_xdp_prog.c:40`), so a crashed
+  receiver never blackholes traffic. A restart reuses the program.
+* The kernel frees a closed socket's queue asynchronously: binding again
+  immediately fails with `EBUSY` and succeeds within a second.
+  `XdpSource::bind` retries for up to 3 s (configurable).
+* With bpffs mounted, libxdp uses its multi-program dispatcher and leaves 4
+  pinned objects after a crash; without it (the WSL default) it loads a
+  single program. Both work.
+* `veth` offloads TX checksums, so frames carry partial UDP checksums; the
+  receiver verifies checksums and rejects them as corrupt (correct
+  behavior). Tests and the demo disable TX offload on the sending end, which
+  is what a physical NIC's frames look like.
+Rejected frames are counted by reason, split into `filtered_frames` (not for
+us) and `corrupt_frames` (loss). *Revisit* if libxdp's attach semantics
+become a problem in production; the alternative is a `bpf_link`-attached
+program we own.

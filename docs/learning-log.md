@@ -387,3 +387,58 @@ means something for IPv6 jumbograms). Both are now documented in
 6. The property test asserts that the generator produced session changes,
    resyncs, and late deliveries at least once. Why is that assertion as
    important as the invariants themselves?
+
+---
+
+## Milestone 3: AF_XDP on a veth pair
+
+### What we built
+
+`caml-transport-xdp` receives Ethernet frames through an AF_XDP socket.
+The kernel runs a tiny XDP program (libxdp's) on the interface that
+redirects each packet into a ring shared with our process; the packet bytes
+land in a memory region we registered (the UMEM). We validate the frame
+with `caml-frame` and lend the UDP payload to the same `FeedProcessor` the
+socket backends use, straight out of UMEM, then hand the frame back to the
+kernel on the fill ring. The `PacketSource` trait didn't change, which was
+the point of designing it as a lending callback in milestone 1.
+
+### Three things the first runs taught us
+
+1. **Checksums on `veth` are not what a NIC sends.** `veth` claims TX
+   checksum offload, so the sender leaves the UDP checksum unfinished for
+   "hardware". Our receiver checks checksums and rejected every frame as
+   corrupt. It was right; the test harness was wrong. A short Python
+   capture proved it (offload on: invalid; off: valid), and the harness now
+   turns offload off, which is what real frames look like.
+2. **Closing a socket is not instant.** The kernel releases an AF_XDP
+   socket's queue asynchronously, so restarting the receiver immediately
+   fails with `EBUSY` for a moment. The backend retries for up to 3 s.
+3. **"Crash-safe" needed checking, not assuming.** Our design notes said a
+   crashed receiver's XDP program detaches automatically. Measured: with
+   libxdp's program it stays attached after `kill -9`. Reading its source
+   showed why that is harmless: it only redirects to a bound socket and
+   otherwise passes packets to the kernel (`XDP_PASS`). The design note was
+   corrected (D7) and the measured behavior recorded (D15).
+
+### Rust concepts
+
+**`unsafe` with a contract.** `xsk-rs` marks ring and UMEM access
+`unsafe` because the compiler can't know which memory a descriptor points
+to. Our job is to uphold the contract: a descriptor is only read between
+leaving the RX ring and returning to the fill ring, and only for the one
+UMEM it came from. The module docs state these rules once, and every
+`unsafe` block's `// SAFETY:` comment says which rule makes it sound (the
+linter rejects blocks without one).
+
+**Features keep heavy dependencies optional.** Building AF_XDP compiles C
+libraries (libxdp, libbpf) and needs clang. Behind the `xdp` feature,
+nobody pays that cost unless they ask for it, and Windows builds still work.
+
+### Check your understanding
+
+7. Why must `poll` return the frames to the fill ring *after* the callback
+   returns, and what would go wrong if it returned them first?
+8. A receiver with checksum verification on reports every frame as
+   `bad_udp_checksum` on one machine but not another. List two likely
+   causes and how you'd tell them apart.

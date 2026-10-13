@@ -3,15 +3,15 @@
 [![CI](https://github.com/martindoboreu/caml-networking/actions/workflows/ci.yml/badge.svg)](https://github.com/martindoboreu/caml-networking/actions/workflows/ci.yml)
 [![coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/martindoboreu/caml-networking/badges/coverage.json)](https://github.com/martindoboreu/caml-networking/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](Cargo.toml)
-[![unsafe](https://img.shields.io/badge/unsafe-none%20in%20production%20code-success)](AGENTS.md)
+[![unsafe](https://img.shields.io/badge/unsafe-forbidden%20in%20core%20crates-success)](AGENTS.md)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 A low-latency market-data receive engine in Rust, built for CAML, a
 student-founded engineering and quantitative research organization at CU
 Boulder. It receives a UDP feed, validates every packet, and accounts for
-every message it does not deliver. Today it runs against a synthetic feed;
-the roadmap is AF_XDP kernel bypass on dedicated hardware
-([hardware plan](docs/hardware-plan.md)).
+every message it does not deliver. Today it runs against a synthetic feed, over
+kernel sockets or AF_XDP (kernel bypass); the roadmap is AF_XDP zero-copy
+on dedicated hardware ([hardware plan](docs/hardware-plan.md)).
 
 ## Highlights
 
@@ -22,13 +22,21 @@ the roadmap is AF_XDP kernel bypass on dedicated hardware
 * **Zero heap allocations on the receive path, proven.** A counting global
   allocator test drives a hostile packet stream and a real socket loop and
   asserts zero allocations.
+* **AF_XDP receive path.** Frames are validated in software and their
+  payloads lent to the pipeline straight out of the shared UMEM, with no
+  copy in user space; CI multicasts 20,000 packets across
+  a `veth` pair and requires every message delivered, plus tests for exact
+  accounting, zero allocations, and crash-safe restart
+  ([`scripts/xdp-veth.sh`](scripts/xdp-veth.sh), decision D15).
 * **Hostile-input tested.** Property tests push about 900,000 adversarial
   datagrams through the pipeline in release CI and check invariants after
   every one; the decoder takes 200,000 fuzz cases; the frame parser is
   differentially tested against `etherparse` on 100,000 mutated frames.
 * **Overflow-free by construction.** Plain integer arithmetic on wire values
   is a compile error on the receive path (`clippy::arithmetic_side_effects`
-  is denied there), and `unsafe` is forbidden outside one test-only crate.
+  is denied there). `unsafe` is forbidden in the core crates; the AF_XDP
+  backend and a test-only allocator opt out explicitly, with a safety
+  argument on every block (lint-enforced).
 * **A wire protocol with a reason for every field.** v2 follows MoldUDP64:
   heartbeats carry the next sequence number so tail loss is detectable,
   sessions are ordered by a monotonic epoch, and one bad packet cannot
@@ -70,7 +78,8 @@ on Linux** (Linux-only code; CI and WSL2), **benchmarked**, **planned**,
 | CI (Ubuntu 24.04 + Windows, debug + release, MSRV, `cargo deny`) | in use: [Actions](https://github.com/martindoboreu/caml-networking/actions) |
 | Line coverage of library crates (`cargo-llvm-cov`), badge, per-run report | in use (CI and `scripts/coverage.sh`) |
 | Linux dev environment: WSL2 Ubuntu 24.04, `scripts/wsl-setup.sh` | in use ([guide](docs/linux-dev.md)) |
-| AF_XDP backend (`caml-transport-xdp`) | planned (next; develop on WSL2 `veth` pairs) |
+| AF_XDP backend (`caml-transport-xdp`, feature `xdp`), copy mode on `veth` | implemented, tested on Linux (CI and WSL2; needs root) |
+| AF_XDP zero-copy on a supported NIC | planned; needs the hardware in the plan |
 | External Thunderbolt NIC for zero-copy bypass | planned; see hardware plan |
 | DPDK backend | design only; **not on the onboard I219** (D8) |
 | SPSC queue / multi-thread pipeline | planned, pending Linux measurements |
@@ -164,11 +173,12 @@ crates/protocol        wire format v2 (no I/O, no deps)
 crates/engine          transports, session gate, sequencer, metrics, receive loop
 crates/frame           Ethernet/VLAN/IPv4/UDP parser for raw-packet backends (no deps)
 crates/sim             synthetic market, fault injection, Ethernet/pcap output (test tooling)
-crates/alloc-count     test-only counting allocator (the one crate with unsafe)
+crates/alloc-count     test-only counting allocator (unsafe, documented)
+crates/transport-xdp   AF_XDP backend, feature `xdp` (unsafe, documented; Linux only)
 apps/receiver          caml-recv CLI
 apps/feed-generator    caml-feed CLI
 apps/bench             caml-bench CLI
-scripts/              check.sh (CI gates), coverage.sh, wsl-setup.sh (Linux dev environment)
+scripts/              check.sh (CI gates), coverage.sh, wsl-setup.sh, xdp-veth.sh (AF_XDP on veth)
 docs/                  architecture, protocol, decisions, benchmarks, hardware plan, learning log
 ```
 
