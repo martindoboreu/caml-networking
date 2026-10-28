@@ -13,7 +13,7 @@
 
 #![allow(unsafe_code)]
 
-use std::error::Error as _;
+use std::error::Error;
 use std::io;
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
@@ -117,20 +117,21 @@ impl std::fmt::Debug for XdpSource {
     }
 }
 
-fn cause(e: &xsk_rs::socket::SocketCreateError) -> Option<&io::Error> {
+/// The OS error underneath an `xsk-rs` error, if there is one.
+fn os_cause<'a>(e: &'a (dyn Error + 'static)) -> Option<&'a io::Error> {
     e.source().and_then(|s| s.downcast_ref::<io::Error>())
 }
 
 fn is_busy(e: &xsk_rs::socket::SocketCreateError) -> bool {
-    cause(e).is_some_and(|io| io.kind() == io::ErrorKind::ResourceBusy)
+    os_cause(e).is_some_and(|io| io.kind() == io::ErrorKind::ResourceBusy)
 }
 
-/// `SocketCreateError` displays only "non-zero error code returned when
-/// creating AF_XDP socket". Keep the OS error's kind and text, so callers
+/// `xsk-rs` errors display only "non-zero error code returned when creating
+/// UMEM" (or "AF_XDP socket"). Keep the OS error's kind and text, so callers
 /// (and the fallback's report) can tell a missing interface from missing
 /// privileges.
-fn socket_error(e: xsk_rs::socket::SocketCreateError) -> io::Error {
-    match cause(&e) {
+fn with_os_cause<E: Error + Send + Sync + 'static>(e: E) -> io::Error {
+    match os_cause(&e) {
         Some(os) => io::Error::new(os.kind(), format!("{e}: {os}")),
         None => io::Error::other(e),
     }
@@ -146,7 +147,7 @@ impl XdpSource {
         })?;
         let frame_count = NonZeroU32::new(FRAMES).ok_or_else(|| io::Error::other("FRAMES is 0"))?;
         let (umem, frames) =
-            Umem::new(UmemConfig::default(), frame_count, false).map_err(io::Error::other)?;
+            Umem::new(UmemConfig::default(), frame_count, false).map_err(with_os_cause)?;
 
         let xdp_flags = match config.mode {
             XdpMode::Generic => XdpFlags::XDP_FLAGS_SKB_MODE,
@@ -173,7 +174,7 @@ impl XdpSource {
                 Err(e) if is_busy(&e) && Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(e) => return Err(socket_error(e)),
+                Err(e) => return Err(with_os_cause(e)),
             }
         };
         let (mut fill_q, comp_q) = fq_and_cq
