@@ -44,7 +44,8 @@ jobs:
     name: coverage
     runs-on: ubuntu-24.04
     permissions:
-      # Publishes the badge JSON to the `badges` branch (master pushes only).
+      # Publishes the badge JSON to the `badges` branch (master pushes to the
+      # public repo only).
       contents: write
     steps:
       - uses: actions/checkout@v7
@@ -74,7 +75,11 @@ jobs:
           name: lcov
           path: target/lcov.info
       - name: Publish coverage badge
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        # The README's badge reads this from the public repo; private copies
+        # and forks skip it (a private repo cannot serve it anyway).
+        if: >
+          github.event_name == 'push' && github.ref == 'refs/heads/master' &&
+          github.repository == 'martindoboreu/caml-networking'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
